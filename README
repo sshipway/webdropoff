@@ -1,0 +1,49 @@
+WEB DROPOFF UTILITY v2.6
+
+Web-based upload utility for later pickup, with added security.
+* Checks against tampering
+* Unique pickup URLS
+* SMTP support
+* Encryption support
+* Sysadmin utility
+* User authentication and confirmation of email addresses
+
+Steve Shipway, Univeristy of Auckland, 2007
+s.shipway@auckland.ac.nz
+http://www.steveshipway.org/forum
+If you like this software, then you can show your appreciation by going to
+http://www.steveshipway.org/software/wishlist.html and sending me a present.
+
+Version 2.6
+
+dropoff.conf : Global configuration file for all
+dropoff : CGI script for dropping off files.  This can be password protected 
+          if you want it to be.
+waiting : CGI script to view all files currently waiting.  This must be 
+          password protected becuase it gives visibility of all dropoff files.
+          Should be used by admins only!
+pickup : CGI script to pick up files.  This should not be password protected
+         unless you are only dropping off for authenticated users.
+cleandropoff : Script to prune log file and clean up dropoff directory, 
+               according to retention limits set in the dropoff.conf
+makekeypair : CGI Script to create public key pairs.  This must be password
+              protected as it stores keys by authenticated username.
+smtpdropoff : Script to be called from (x)inetd to accept files dropped off
+              via SMTP (eg: Ricoh MFD scan-to-email)
+smtpdropoff.xinetd : Xinetd configuration file for smtpdropoff
+*.inc : These are HTML templates for the head and foot of the generated pages.
+        Put them in a directory and configure this in the dropoff.conf
+decrypt : Utility to decrypt a stored file, given a private key
+xpickup.pl : ActivePerl/Tk script for windows clients to pick up and decrypt
+             all in one go.  Requires Crypt::SSLeay if using https, plus the
+             Crypt::RSA, Crypt::CBC and Crypt::Blowfish modules.
+xpickup.exe : PAR-compiled copy of xpickup.pl that should work standalone,
+              but this is not fully tested.  Hardcoded to UoA pickup URL 
+              though so of dubious use.
+
+# All scripts need to have the configuration file location set
+
+# encrypt/decrypt require Crypt::CBC, Crypt::Blowfish, Crypt::RSA
+
+# SMTPdropoff only currently works properly for RICOH MFDs
+

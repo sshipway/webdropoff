@@ -1,0 +1,158 @@
+#!/usr/bin/perl
+#vim:ts=4
+#
+# Steve Shipway, University of Auckland, s.shipway@auckland.ac.nz
+#
+# Prune a log to n days (corresponding to cleaning out the dropoff)
+#
+# Version 2.5: initial version
+
+use strict;
+use Time::Local;
+
+my($VERSION) = "2.5";
+
+my($CONFIG) = "/u01/etc/dropoff.conf";
+my($DEBUG) = 0;
+
+#############################################################################
+my(%collected) = ();
+my(%config) = ();
+sub readconfig() {
+	open CONFIG,"<$CONFIG" or return "Cannot open $CONFIG: $!";
+	while ( <CONFIG> ) {
+		chomp; next if( /^\s*#/ );
+		if( /^\s*(\S+)\s*=\s*(\S.*)/ ) { $config{lc $1} = $2; }
+	}
+	close CONFIG;
+	return 0;
+}
+
+# Delete files which are just too old.
+sub cleanfiles() {
+	my(@s,$f,$n,$s);
+	my($min) = 0;
+	my($smtpmin) = 0;
+	my($cmin) = 0;
+
+	$min = time - ($config{keepdays}*24*3600) if($config{keepdays});
+	$smtpmin = time - ($config{keepdayssmtp}*24*3600)
+		if($config{keepdayssmtp});
+	$cmin = time - ($config{keepdayscollected}*24*3600)
+		if($config{keepdayscollected});
+	$smtpmin = 0 if($smtpmin<$min);
+	$cmin = 0 if($cmin<$min);
+
+	return if(!$min and !$cmin and !$smtpmin);
+	
+	print "cleaning up dropoff area\n";
+	print "Delete all before ".localtime($min)."\n" if($min);
+	print "Delete SMTP before ".localtime($smtpmin)."\n" if($smtpmin);
+	print "Delete collected before ".localtime($cmin)."\n" if($cmin);
+
+	opendir DH,$config{dropdir};
+	$n = 0;
+	foreach $f ( grep /\.info$/, readdir DH ) {
+		@s = stat $config{dropdir}."/$f";
+		if($s[9]<$min) {
+			unlink $config{dropdir}."/$f" unless($DEBUG);
+			$f =~ s/\.info$//;
+			unlink $config{dropdir}."/$f" unless($DEBUG);
+			print "Delete $f\n";
+			$n += 1;		
+			next;
+		}
+		# Now check for SMTP
+		if($s[9]<$smtpmin) {
+			# is it SMTP?
+			open INFO,"<".$config{dropdir}."/$f";
+			$s = 0;
+			while(<INFO>) { if( /^\s*Origin:.*SMTP/ ) { $s = 1; last; } }
+			close INFO;
+			if($s) {
+				unlink $config{dropdir}."/$f" unless($DEBUG);
+				$f =~ s/\.info$//;
+				unlink $config{dropdir}."/$f" unless($DEBUG);	
+				print "Delete $f (SMTP)\n";
+				$n += 1;		
+				next;
+			}
+		}
+		if($s[9]<$cmin) {
+			# is it collected?
+			if(($f =~ /(\S+)\.(\d+)/)and $collected{"$1:$2"}) {
+				unlink $config{dropdir}."/$f" unless($DEBUG);
+				$f =~ s/\.info$//;
+				unlink $config{dropdir}."/$f" unless($DEBUG);	
+				print "Delete $f (Collected)\n";
+				$n += 1;		
+				next;
+			}
+		}
+	}
+	closedir DH;
+	print "$n files were removed.\n";
+}
+
+# Prune the log.
+sub cleanlog() {
+	my($line,$time,$mint,$n);
+
+	print "Cleaning up log file\n";
+	$n = 0;
+
+	$mint =  time - ($config{keepdays}*24*3600);
+
+	print "Delete before ".localtime($mint)."\n" if($DEBUG);
+
+	if($DEBUG) {
+		open OLOG, "<".$config{logdir}."/dropoff.log" or 
+			return "Cannot open old log";
+		open LOG, ">".$config{logdir}."/dropoff.log.new" or 
+			return "Canot create new log";
+	} else {
+		rename( $config{logdir}."/dropoff.log",
+			$config{logdir}."/dropoff.log.old" ) or return "Cannot rename";
+		open OLOG, "<".$config{logdir}."/dropoff.log.old" or 
+			return "Cannot open old log";
+		open LOG, ">>".$config{logdir}."/dropoff.log" or 
+			return "Canot create new log";
+	}
+	open ERR, ">>".$config{logdir}."/dropoff.err" or 
+		return "Canot create error log";
+	open OLD, ">>".$config{logdir}."/dropoff.archive" or 
+		return "Canot create archive log";
+	chmod (oct($config{logmode}),$config{logdir}."/dropoff.log")
+		if($config{logmode});
+	chown ((getpwnam($config{logowner}))[2,3],$config{logdir}."/dropoff.log")
+		if($config{logowner});
+
+	while( $line = <OLOG> ) {
+		if( $line =~ /^(\d+)\/(\d+)\/(\d+)\s+(\d\d?):(\d\d?)/ ) {
+			$time = timelocal(0,$5,$4,$1,($2-1),($3-1900));
+#			print "$mint $time ".localtime($time)." $line" if($DEBUG);
+			if($time<$mint) { 
+				$n += 1; 
+				print OLD $line;
+			} else {
+				print LOG $line;
+				$collected{"$1:$2"} = 1 if($line =~ /PICKUP\s*(\S+)\s*(\d+)/);
+			}
+		} else {
+			print ERR $line;
+		}
+	}
+	close LOG;
+	close OLOG;	
+	unlink $config{logdir}."/dropoff.log.old" unless($DEBUG);
+	print "$n entries were removed.\n";
+	return 0;
+}
+
+#############################################################################
+# Main Code
+$|=1;
+readconfig();
+cleanlog();
+cleanfiles();
+exit 0;

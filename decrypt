@@ -1,0 +1,102 @@
+#!/usr/bin/perl
+#
+# decrypt a file
+
+use strict;
+use Crypt::CBC;
+use Crypt::RSA;
+
+# Configurable parameters...
+my($CONFIG) = "/u02/etc/dropoff.conf";
+
+#############################################################################
+my($filename,$newfilename);
+my($privatekey);
+my($KEYLEN,$IVLEN,$CIPHER) = (56,8,"Blowfish");
+my(%config) = ();
+#############################################################################
+sub readconfig() {
+    open CONFIG,"<$CONFIG" or return "Cannot open $CONFIG: $!";
+    while ( <CONFIG> ) {
+        chomp; next if( /^\s*#/ );
+        if( /^\s*(\S+)\s*=\s*(\S.*)/ ) { $config{lc $1} = $2; }
+    }
+    close CONFIG;
+    return 0;
+}
+
+sub decrypt {
+	my($code,@resp);
+	my($data,$enc,$rsa,$key,$iv,$cipher);
+
+	$newfilename = $filename.".out";
+
+	# decrypt file
+	open ENC,"<$filename" or do {
+		print "Cannot open: $!\n"; exit 1;
+	};
+	binmode ENC;
+	print "Obtaining one-time key\n";
+	# first 128 bytes are encrypted $key.$iv for RSA key
+	if(read (ENC,$enc,128)	!= 128 ) {
+		print "Decryption failed\n"; exit 1;
+	}
+	# decrypt temp key with publickey
+	$rsa = new Crypt::RSA(ES=>'OAEP',KF=>'SSH');
+	if(!$rsa) {
+		print "RSA error 1\n"; exit 1;
+	}
+	print "Decrypting key\n";
+	$data = $rsa->decrypt(Cyphertext=>$enc,Key=>$privatekey);#,Armour=>1);
+	if( !$data ) {
+		print("Could not decrypt one-time key: do you have the right Private Key? ".$rsa->errstr."\n");
+		exit 1;
+	}
+	if( length $data != ($KEYLEN+$IVLEN) ) {
+		print("Could not decrypt one-time key: do you have the right Private Key? Bytes=".(length $data)."!=64");
+		exit 1;
+	}
+	$key = substr $data, 0, $KEYLEN;
+	$iv = substr $data, $KEYLEN, $IVLEN;
+	$cipher = Crypt::CBC->new(-literal_key => 1, -cipher=>$CIPHER,
+            -key => $key, -iv => $iv, -header => 'none',
+	    -keysize=>$KEYLEN );
+
+	# save file
+	print "Decrypting\n";
+	open OUT,">$newfilename" or do {
+		print("Unable to write decrypted file $newfilename: $!");
+		exit 1;
+	};
+	binmode OUT;
+	$cipher->start('decrypting');
+	while ( read ENC,$enc,128 ) { 
+#		doinfo("Cypher: ".(unpack "H32",$_));
+		$data = $cipher->crypt($enc); 
+#		doinfo("Decrypt: ".(unpack "H32",$data));
+		print OUT $data;
+	}
+	print OUT $cipher->finish();
+	close ENC;
+	close OUT;
+	print "Decryption finished\n";
+}
+
+readconfig;
+$filename = $ARGV[1];
+
+if(! -r $filename) {
+	print "Cannot read '$filename'.\n";
+	print "Usage: $0 private.key encryptedfile [password]\n";
+	exit 1;
+}
+
+print "Loading private key\n";
+$privatekey = new Crypt::RSA::Key::Private(KF=>'SSH',Filename=>$ARGV[0]);
+if(!$privatekey) {
+	print "Cannot load private key ".$ARGV[0]."\n";
+	exit 1;
+}
+if($ARGV[2]) { $privatekey->reveal(Password=>$ARGV[2]); }
+decrypt;
+exit 0;

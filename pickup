@@ -1,0 +1,460 @@
+#!/usr/bin/perl -w
+# vim:ts=4
+#
+# pickup
+# Steve S 2004
+# Pick up the file dropped off by the dropoff command
+# Modified 14/4/5 to add 'attachment' to Content-Disposition to get around 
+# stupid Microsoft violation of RFCs in MSIE
+#
+# 2007 - Add notification to original sender of pickup
+#      - v2.1 - add decryption framework
+# 2014 - v2.6 - add two-step pickup for autodelete
+
+use strict;
+use CGI;
+use Digest::MD5;
+use IO::Socket;
+use Sys::Hostname;
+
+# Configurable parameters...
+my($CONFIG) = "/u01/etc/dropoff.conf";
+
+# Globals
+my($VERSION) = "2.6";
+my($q);
+my($hash,$code) = ("","");
+my($authuser);
+my($encrypted)  = 0;
+my($keyfile);
+my($KEYLEN,$IVLEN,$CIPHER) = (56,8,"Blowfish");
+my(%config) = ();
+
+sub readconfig() {
+	open CONFIG,"<$CONFIG" or return "Cannot open $CONFIG: $!";
+	while ( <CONFIG> ) {
+		chomp; next if( /^\s*#/ );
+		if( /^\s*(\S+)\s*=\s*(\S.*)/ ) { $config{lc $1} = $2; }
+	}
+	close CONFIG;
+	return 0;
+}
+sub dolog($) {
+    my($msg) = $_[0];
+    my(@now) = localtime(time);
+    my($date);
+    $now[1] = "0".$now[1] if($now[1]<10);
+    $date = $now[3]."/".($now[4]+1)."/".($now[5]+1900)." ".$now[2].":".$now[1];
+    open LOG, ">>".$config{logdir}."/dropoff.log" or return;
+    print LOG "$date\t$msg\n";
+    close LOG;
+}
+sub scanlog($$) { # obtain the email addr of the sender of the file
+	my($id,$code) = @_;
+	my($email) = "";
+	open LOG, "<".$config{logdir}."/dropoff.log" or return $email;
+	while ( <LOG> ) {
+		# date\tRECV\tupi?\tID\tCODE\ttoemail\tfromemail\tfilename\tIPaddr
+		if( /RECV\s+\S*\s+$id\s+$code\t[^\t]+\t(\S+\@\S+)/ ) {
+			$email = $1; last;
+		}
+		if( /RECV\s+\S*\s+$id\s+$code\t[^\t]+\t.*<(\S+\@\S+)>/ ) {
+			$email = $1; last;
+		}
+		if( /RECV\s+\S*\s+$id\s+$code\t[^\t]+\tNONE/ ) {
+			$email = "NONE"; last;
+		}
+	}
+	close LOG;
+	return $email;
+}
+
+# Get a response from the remote mail server (called by dorelease)
+sub readstatus($) {
+    my($sock) = shift;
+    my($stat, $resp, $first);
+    my($i) = 0;
+    my($rfd,$wfd,$xfd);
+    my($n,$t);
+
+    $xfd = 0;
+    vec($xfd,0,1)=0;
+    $rfd = $wfd = $xfd;
+    vec($rfd,$sock,1)=1;
+    ($n,$t) = select $rfd,$wfd,$xfd,$config{smtptimeout}; # 10 sec timeout
+    if(!$n or !$rfd) { return (999,"Timeout"); }
+    $resp = <$sock> ;
+    $resp = "999 Timeout waiting for response" if(!$resp);
+    $stat = 0;
+    if( $resp =~ /^(\d\d\d)\s+(\S.*)/ ) { ($stat,$first) = ($1,$2); }
+    return ($stat,$first);
+}
+
+sub do_email($$$) {
+	my($to,$filename,$who) = @_;
+	my($file);
+	my($url,$sock,$c,$m,$hash);
+	my($svr,$id,$from,$msg,$subject);
+
+	$subject = "[".$config{subject}."] File collected";
+	$from = $config{mailfrom};
+
+    # open conenction to SMTP server.  return error if failed.
+    $sock = new IO::Socket::INET(PeerAddr=>$config{smtpserver}, 
+		PeerPort=>$config{smtpport}, Proto=>'tcp');
+    if(!$sock) { return "Cannot connect to server"; }
+#    fcntl($sock, F_SETFL(), O_NONBLOCK());
+    ($c,$m) = readstatus($sock); # get the welcome message
+	$m =~ /^(\S+)/; $svr = $1;
+
+    # send message envelope, check return codes
+    print $sock "HELO ".hostname()."\n";
+    ($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock;
+        return "Problem identifying myself";
+    }
+    print $sock "MAIL FROM: <$from>\n";
+    ($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock; 
+        return "Problem with sender";
+    }
+
+  	print $sock "RCPT TO: <$to>\n";
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+   	     close $sock; 
+   	     return "Problem with recipient";
+    }
+
+    # Now send the message
+    print $sock "DATA\n";
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock; 
+        return "Problem sending data.";
+    }
+
+	# send message
+	print $sock "From: $from\n";
+	print $sock "To: $to\nSubject: $subject\nX-Mailer: UoA File dropoff\n\n";
+	print $sock "The file '$filename' which you uploaded to the WebDropoff system\n";
+#	print $sock "has been successfully picked up.\n";
+	print $sock "has been successfully picked up by client IP $who\n";
+#	print $sock "Unfortunately it is not possible to confirm the identity of the person\nwho has picked up the file.\n";
+	print $sock "\n".$config{mailfromname}."\n";
+
+	# close
+	print $sock "\n.\n";
+
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+		close $sock; 
+        return "Problem sending message";
+    }
+	$m =~ /(\S+)\s*$/; $id = $1;
+	print $sock "QUIT\n";
+    close $sock;
+
+	return 0; # success
+}
+
+# Check the file's checksum: return true if fail
+sub checkfile($$) {
+	my($file,$csum) = @_;
+	my($c);
+	
+	open(FILE, $file) or return 1;
+	binmode(FILE);
+	$c = Digest::MD5->new->addfile(*FILE)->hexdigest;
+	return 1 if($c ne $csum);
+	return 0;
+}
+
+sub do_header {
+    my(%html);
+    print $q->header(-expires=>"now")."\n";
+    %html = (-title=>"File Pickup",-bgcolor=>"#FFFFFF",
+        -leftmargin=>1, -topmargin=>0, -marginwidth=>1, -marginheight=>0 );
+    $html{-style}={src=>$config{stylesheet}} if($config{stylesheet});
+    print $q->start_html(%html)."\n";
+
+    if( $config{pageheaderpickup} and -r $config{pageheaderpickup} ) {
+        open HTML,"<".$config{pageheaderpickup};
+        while(<HTML>) { print; }
+        close HTML;
+    }
+}
+
+sub do_footer {
+
+    if( $config{pagefooterpickup} and -r $config{pagefooterpickup} ) {
+        open HTML,"<".$config{pagefooterpickup};
+        while(<HTML>) { print; }
+        close HTML;
+    }
+	print $q->end_html;
+}
+
+sub errorpage($) {
+	do_header;
+	print $q->h1("Error Encountered");
+	print $q->p($_[0])."\n";
+	print $q->br.$q->hr."\n";
+	print $q->p($q->a({href=>$q->url(-path_info=>1)},"Try again"))."\n";
+	do_footer;
+}
+
+# Create the form for file download
+# Fields: passcode, go (submit button)
+sub do_form {
+	my $f = $config{dropdir}."/$hash.$code";
+	my($contenttype,$contentfilename,$cleanup)=('','',0);
+
+	print $q->start_multipart_form(-method=>'POST',-action=>$q->url(-path_info=>1))
+		."<TABLE align=center border=0 cellspacing=2 cellpadding=1 bgcolor=#eeffee>\n";
+	
+	if(!$q->path_info()) {
+		print "<TR><TD>Filehash</TD><TD>"
+			.$q->textfield(-name=>'hash', -value=>$hash,-size=>40, -override=>1)."</TD></TR>\n";
+	}
+	print "<TR><TD>Passcode</TD><TD>"
+		.$q->textfield(-name=>'passcode', -value=>$code,-size=>10, -override=>1)."</TD></TR>\n" unless($code);
+
+	# If we have both pathinfo AND code, we can potentially
+	# read the info file and get the filename, plus if it will be
+	# deleted after pickup.
+	if($hash and $code and -f $f) {
+	  if( open(INFO, "<$f.info") ) {
+		while( <INFO> ) {
+			chomp;
+			if( /^Content-Type:\s*(\S+)/i ) { $contenttype = $1; }
+			if( /^Content-Disposition:\s*(\S.*)/i ) { $contentfilename = $1; }
+			if( /^Origin:\s*SMTP/i ) { $cleanup = 1; } # delete after pickup
+			if( /^Origin:.*-XXXX/i ) { $encrypted = 1; }
+			if( /^Encrypted-File:\s*(\S+)/ ) { $encrypted=1; }
+			if( /^Encrypted-By:\s*(\S+)/ ) { $encrypted=1; }
+		}
+		close INFO;
+	  }
+	}
+	if($contentfilename) {
+		print "<TR><TD>Filename<BR /><small>MIME type</small></TD><TD>$contentfilename<BR /><small>$contenttype</small></TR>\n";
+	}
+	if( (($cleanup and $config{smtpdelete}) 
+			or( !$cleanup and $config{webdelete})) ) {
+		print "<TR><TD COLSPAN=2><B>Warning</B>: <I>This file will be automatically deleted immediately after pickup.</I></TD></TR>\n";
+	}
+
+	if($encrypted) {
+		print "<TR><TD COLSPAN=2><I>This file has been encrypted with your public key.</I></TD></TR>\n";
+		print "<TR><TD>Private Key<BR><small>(required to decrypt)</small></TD><TD>"
+			.$q->filefield(-name=>'key', -default=>'',-size=>25,-maxlength=>80, -override=>1)
+			."<BR><small>- or -</small><BR>"
+			.$q->checkbox(-name=>'raw', -checked=>0,-value=>1,-label=>"Do not decrypt", -override=>1)
+			."</TD></TR>\n";
+	}
+	print "<TR><TD></TD><TD>"
+		.$q->submit(-name=>'go', -value=>'Download this file')."</TD></TR>\n";
+
+	print "</TABLE>".$q->end_form()."\n";
+}
+
+sub do_download {
+	my( $passcode, $checksum );
+	my( $contenttype, $contentfilename );
+	my( $cleanup ) = 0;
+	my( $f, $e );
+	my(%header) = ();
+
+	$checksum = $hash;
+	$passcode = $code;
+	$passcode = '0' if(!$passcode);
+
+	$f = $config{dropdir}."/$checksum.$passcode";
+
+	if(! -f $f ) {
+		dolog("INVALID\t$authuser\t$checksum\t$passcode\t".$q->remote_host());
+		errorpage "Invalid passcode, or non-existent file.  Maybe the file has expired and been deleted?";
+		return;
+	}
+
+	if( checkfile($f, $checksum) ) {
+		dolog("CHECKSUM\t$authuser\t$checksum\t$passcode\t".$q->remote_host());
+		errorpage "The file has been tampered with!  Unable to download it.";
+		return;
+	}
+
+	$contenttype = "";
+	$contentfilename = "filename.dat";
+	if( open(INFO, "<$f.info") ) {
+		while( <INFO> ) {
+			chomp;
+			if( /^Content-Type:\s*(\S+)/i ) { $contenttype = $1; }
+			if( /^Content-Disposition:\s*(\S.*)/i ) { $contentfilename = $1; }
+			if( /^Origin:\s*SMTP/i ) { $cleanup = 1; } # delete after pickup
+			if( /^Origin:.*-XXXX/i ) { $encrypted = 1; }
+			if( /^Encrypted-File:\s*(\S+)/ ) { $encrypted=1; }
+			if( /^Encrypted-By:\s*(\S+)/ ) { $encrypted=1; }
+		}
+		close INFO;
+	}
+	# check for encrypted files without key or 'as is' option
+	# or we're going to delete it but didnt show a form first
+	if(($encrypted and !$q->param('raw') and !$q->param('key')) or(
+			(($cleanup and $config{smtpdelete}) 
+			or( !$cleanup and $config{webdelete})) 
+			and !$q->param('go')
+	)) {
+		do_header;
+		do_form;
+		do_footer;
+		return;
+	}
+
+	# Set content type
+	$contenttype = "application/x-msword" 
+		if(!$contenttype and $contentfilename =~ /\.doc$/ );
+	$contenttype = "application/x-msexcel" 
+		if(!$contenttype and $contentfilename =~ /\.xl[st]$/ );
+	$contenttype = "application/octet-stream" if(!$contenttype);
+	$header{'-expires'} = "now";
+	$header{'-type'} = $contenttype if($contenttype);
+	$header{'-Content-Disposition'} = "attachment; filename=\"$contentfilename\"" if($contentfilename);
+
+	# If we get this far, then the file exists and is acceptable.  Let's download it.
+	if(!$encrypted or !$q->param('key') ) {
+#		if($encrypted) {
+#			$header{'-type'} = 'application/octet-stream';
+#			$header{'-Content-Disposition'} = "attachment; filename=\"data.enc\"";
+#			$header{'-Content-Disposition'} = "attachment; filename=\"$contentfilename.enc\"" if($contentfilename);
+#		}
+		print $q->header(%header);
+		open IN,"<$f";
+		binmode( IN ); binmode( STDOUT );
+		while( <IN> ) { print; }
+		close IN;
+	} else {
+		# We have to decrypt the file first
+		require Crypt::RSA;
+		require Crypt::CBC;	
+		my($key,$iv,$enc,$rsa,$data,$cipher);
+		my($ui,$kf,$privatekey,$kfn);
+
+		# First, obtain the private key and load it
+		$kf = $q->upload('key');
+		$ui = $q->uploadInfo($q->param('key'));
+		if(!$kf) {
+			errorpage("Unable to read private key file ".$q->param('key')
+				." of type ".$ui->{'Content-Type'});
+			dolog("ERROR\t$authuser\t$checksum\t$passcode\t$contentfilename\t".$q->remote_host()."\tReceiving private key failed: ".$q->param('key'));
+			return;
+		}
+		$kfn = $config{workdir}."/key.$$";
+		open KF,">$kfn";
+		binmode($kf); binmode(KF);
+		while( <$kf> ) { print KF; }
+		close KF; close $kf;
+		$privatekey = new Crypt::RSA::Key::Private(KF=>'SSH',Filename=>$kfn );
+		unlink $kfn;
+		if(!$privatekey) {
+			errorpage("Unable to load private key file");
+			dolog("ERROR\t$authuser\t$checksum\t$passcode\t$contentfilename\t".$q->remote_host()."\tLoading private key failed");
+			return;
+		}
+
+		# Now obtain the temporary key from data stream
+		open IN,"<$f";
+		binmode( IN ); 
+		if(read (IN,$enc,128)  != 128 ) {
+			errorpage("Unable to extract key information");
+			dolog("ERROR\t$authuser\t$checksum\t$passcode\t$contentfilename\t".$q->remote_host()."\tDecrypting file: read key");
+			return;
+        }
+        # decrypt temp key with privatekey
+        $rsa = new Crypt::RSA(ES=>'OAEP',KF=>'SSH');
+        if(!$rsa) {
+			errorpage("Unable to use RSA algorithms");
+			dolog("ERROR\t$authuser\t$checksum\t$passcode\t$contentfilename\t".$q->remote_host()."\tDecrypting file: RSA");
+			return;
+        }
+        $data = $rsa->decrypt(Cyphertext=>$enc,Key=>$privatekey);
+        if( !$data ) {
+			errorpage("Unable to decrypt: ".$rsa->errstr);
+			dolog("ERROR\t$authuser\t$checksum\t$passcode\t$contentfilename\t".$q->remote_host()."\tRSA: ".$rsa->errstr);
+			return;
+        }
+        if( length $data != 64 ) {
+			errorpage("Incorrect private key file");
+			dolog("ERROR\t$authuser\t$checksum\t$passcode\t$contentfilename\t".$q->remote_host()."\tRSA: Invalid private key");
+			return;
+		}
+		$key = substr $data, 0, $KEYLEN;
+        $iv = substr $data, $KEYLEN, $IVLEN;
+        $cipher = Crypt::CBC->new(-literal_key => 1, -cipher=>$CIPHER,	
+			-header => 'none',
+            -key => $key, -iv => $iv, -keysize => $KEYLEN
+		);
+		dolog( "KEY\t".(unpack "H128",$data));
+
+		# now decrypt the file
+		print $q->header(%header);
+		binmode( STDOUT );
+		$cipher->start('decrypting');
+		while( read IN,$enc,128 ) { print $cipher->crypt($enc); }
+		close IN;
+		print $cipher->finish();
+		dolog("DECRYPT\t$authuser\t$checksum\t$passcode\t$contentfilename\t".$q->remote_host());
+	}
+
+	dolog("PICKUP\t$authuser\t$checksum\t$passcode\t$contentfilename\t".$q->remote_host());
+
+	$e = scanlog( $checksum, $passcode );
+	if( $e ) {
+		if( $e ne 'NONE' ) {
+			do_email($e,$contentfilename,$q->remote_host());
+			dolog("CONFIRM\t$authuser\t$checksum\t$passcode\t$e\t".$q->remote_host());
+		}
+	} else {
+		dolog("ERROR\t$authuser\t$checksum\t$passcode\tCannot send confirm email\t".$q->remote_host());
+	}
+
+	if( ($cleanup and $config{smtpdelete})
+		or( !$cleanup and $config{webdelete} ) ) {
+		unlink $f;
+		unlink "$f.info";
+		dolog("DELETE\t$authuser\t$checksum\t$passcode\t$contentfilename\t".$q->remote_host());
+	}
+}
+
+#########################################################################
+# MAIN
+
+readconfig;
+
+$q = new CGI;
+if($q->path_info()=~ /\/([^\/]+)\/?(\d*)/) {
+	($hash,$code) = ( $1, $2);
+}
+if( $q->param('passcode') ) {
+	$code = $q->param('passcode'); $code=$1 if($code and $code=~/(\d+)/);
+}
+$authuser = $q->remote_user();
+$authuser = "" if(!$authuser);
+
+#if(!$hash) {
+#	errorpage "Invalid link: No filehash specified.";
+#	exit 0;
+#}
+
+# Have we been given a form?
+if($code and $hash) {
+	do_download;
+} else {
+	do_header;
+	do_form;
+	do_footer;
+}
+
+exit 0;

@@ -1,0 +1,388 @@
+#!/usr/bin/perl
+# vim:ts=4
+#
+# Catch emails from ricoh printscanners
+# Called from xinetd
+#
+# Version 1.2: correct handling of invalid envelope email addresses
+#              correct harndling of arguments eg -d
+#         2.5: Bring versions in line; correct return codes, case insensitive
+#         2.6: More intelligence in attachment extraction
+
+use strict;
+use FileHandle;
+use MIME::Base64;
+use Digest::MD5;
+use IO::Socket;
+use Sys::Hostname;
+
+my($CONFIG) = "/u01/etc/dropoff.conf";
+my($TYPE) = "";
+my($DEBUG) = 0;
+my($VERSION) = "2.6";
+
+##############################################################################
+my($cmd) = "";
+my($from,$to);
+
+#############################################################################
+my(%config) = ();
+
+sub readconfig() {
+	open CONFIG,"<$CONFIG" or return "Cannot open $CONFIG: $!";
+	while ( <CONFIG> ) {
+		chomp; next if( /^\s*#/ );
+		if( /^\s*(\S+)\s*=\s*(\S.*)/ ) { $config{lc $1} = $2; }
+	}
+	close CONFIG;
+	return 0;
+}
+sub logprint($) {
+	my($m) = $_[0];
+	if($DEBUG) {
+		print LOG "> $m" or do { 
+			print "501 logging error: $!\n";
+			return;
+		};
+	}
+	print $m;
+}
+sub dolog($) {
+    my($msg) = $_[0];
+    my(@now) = localtime(time);
+    my($date);
+	$now[1] = "0".$now[1] if($now[1]<10);
+    $date = $now[3]."/".($now[4]+1)."/".($now[5]+1900)." ".$now[2].":".$now[1];
+    open DROPLOG, ">>".$config{logdir}."/dropoff.log" or return;
+    print DROPLOG "$date\t$msg\n";
+    close DROPLOG;
+}
+sub timeout {
+	logprint "502 Timeout.\r\n";
+	print LOG "* End at ".localtime(time)."\n" if($DEBUG);
+	exit 0;
+}
+
+# Rename file to digest name: return new name, or null
+sub newname($) {
+    my($oldname) = $_[0];
+    my($newname);
+    my($file) = $oldname;
+
+    open(FILE, $file) or do {
+		print LOG "* Cannot open $file: $!\n";
+		return "";
+	};
+    binmode(FILE);
+    $newname = Digest::MD5->new->addfile(*FILE)->hexdigest.".".(($$<<4)+$$);
+    rename($file, $config{dropdir}."/$newname") or do {
+		print LOG "* Cannot rename $file to ".$config{dropdir}."/$newname : $!\n";
+		return "";
+	};
+    return $newname;
+}
+
+
+# Get a response from the remote mail server 
+sub readstatus($) {
+    my($sock) = shift;
+    my($stat, $resp, $first);
+    my($i) = 0;
+    my($rfd,$wfd,$xfd);
+    my($n,$t);
+
+    $rfd = $wfd = $xfd = 0;
+    vec($rfd,$sock,1)=1;
+    ($n,$t) = select $rfd,$wfd,$xfd,$config{smtptimeout}; # 10 sec timeout
+    if(!$n or !$rfd) { return (999,"Timeout"); }
+    $resp = <$sock> ;
+    $resp = "999 Timeout waiting for response" if(!$resp);
+    $stat = 0;
+    if( $resp =~ /^(\d\d\d)\s+(\S.*)/ ) { ($stat,$first) = ($1,$2); }
+    return ($stat,$first);
+}
+
+sub notify($$$) {
+	my($to,$hash,$pass) = @_;
+	my($file);
+	my($url,$sock,$c,$m);
+	my($svr,$id,$from,$msg,$subject);
+    my($filename);
+    my(@now) = localtime(time);
+    my($date);
+    my($size);
+    my(@sb);
+
+    $date = $now[3]."/".($now[4]+1)."/".($now[5]+1900)." ".$now[2].":".$now[1];
+
+    $file = "$hash.$pass";
+    @sb = stat($config{dropdir}."/$file");
+    $size = $sb[7];
+
+    $filename = "scan.$TYPE";
+
+	$url = $config{pickupurl}."/$hash";
+	$subject = "[".$config{smtpsubject}."] File ready for collection";
+
+    # open conenction to SMTP server.  return error if failed.
+    $sock = new IO::Socket::INET(PeerAddr=>$config{smtpserver}, 
+		PeerPort=>$config{smtpport}, Proto=>'tcp');
+    if(!$sock) {
+		return "Cannot connect to server";
+    }
+#    fcntl($sock, F_SETFL(), O_NONBLOCK());
+    ($c,$m) = readstatus($sock); # get the welcome message
+	$m =~ /^(\S+)/; $svr = $1;
+
+    # send message envelope, check return codes
+    print $sock "HELO ".hostname()."\n";
+    ($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock;
+        return "Problem identifying myself";
+    }
+    print $sock "MAIL FROM: <$from>\n";
+    ($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock; 
+        return "Problem with sender";
+    }
+
+  	print $sock "RCPT TO: <$to>\n";
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+   	     close $sock; 
+   	     return "Problem with recipient";
+    }
+
+    # Now send the message
+    print $sock "DATA\n";
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock; 
+        return "Problem sending data.";
+    }
+
+	# send message
+	print $sock "From: ".$config{mailfrom}."\n";
+    print $sock "To: $to\nSubject: $subject\nX-Mailer: SMTP dropoff\n\n";
+    print $sock "A scanned image has been uploaded to the ".$config{organisation}." dropoff staging area for you.\n";
+    print $sock "This file will be available for pickup until "
+        .localtime(time+($config{keepdayssmtp}*24*3600))."\n\n"
+        if($config{keepdayssmtp});
+
+    print $sock "To collect the file, use a web browser to go to the URL:\n";
+#   print $sock "$url and give the passcode '$pass'\n";
+    print $sock "$url/$pass\n\n";
+    print $sock "The URL above has to be pasted in one line, please ensure this is the case if your\n";
+    print $sock "e-mail client truncates it.\n\n"; 
+    print $sock "If you have trouble collecting your file when clicking on the above link, please instead right-click the link and choose 'Open in a new window', or else cut-and-paste the URL into a new window.\n\n";
+
+	if($config{smtpdelete}) {
+	print $sock "NOTE: You will only be allowed to collect this file ONCE.  After the first collection attempt, the file will be deleted.  Once download starts, do not cancel, otherwise you will not be able to try again.\n\n\n";
+	}
+    print $sock "File information:\n";
+    print $sock "File size: $size bytes\n";
+    print $sock "Uploaded at: $date\n";
+    print $sock "\n".$config{mailfromname}."\n";
+
+	# close
+	print $sock "\n.\n";
+
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+		close $sock; 
+        return "Problem sending message";
+    }
+	$m =~ /(\S+)\s*$/; $id = $1;
+	print $sock "QUIT\n";
+    close $sock;
+
+	dolog("SEND\t\t$hash\t$pass\t$to\t$from\t$id\t$svr");
+
+	print LOG "* Notified at ".localtime(time)."\n" if($DEBUG);
+
+	return 0; # success
+}
+
+
+
+# Take the specified file, and move it to webdropoff.  Create the info file,
+# and email the intended recipient
+sub dropoff($$) {
+	my($to,$file) = @_;
+	my($hash) = "";
+	my($code) = "";
+	my($f);
+
+	# calculate checksum
+	# rename file
+	$f = newname($file);
+	if(!$f) {
+		print LOG "* Renaming failed.\n";
+		return "";
+	}
+	if($f =~ /(.*)\.(\d+)/ ) { ($hash,$code)=($1,$2); }
+
+	# create info file
+    if( open INFO, ">".$config{dropdir}."/$f.info" ) {
+		if($TYPE eq "pdf") {
+        	print INFO "Content-Type: application/pdf\n";
+		} else {
+        	print INFO "Content-Type: image/$TYPE\n";
+		}
+        print INFO "Content-Disposition: scan.$TYPE\n";
+        print INFO "Origin: SMTP-".(uc $TYPE)."\n";
+        print INFO "Notified: ".localtime()."\n";
+        print INFO "Recipient: $to\n";
+        close INFO;
+    }
+	
+	# notify user
+	notify($to,$hash,$code);
+
+	# append to dropoff log
+	dolog("RECV\tRICOH\t$hash\t$code\t$to\tNONE\tscan.$TYPE\t");
+
+	# and go home
+	return $hash;
+}
+sub reademail {
+	my ( $line );
+	my($qid,$tmpfile);
+	my($data,$section);
+	my($inhead) = 1;
+	my($mimesep) = "--";
+	my($indata) = 0;
+	
+	print LOG "< Envelope from: $from\n" if($DEBUG);
+	print LOG "< Envelope to  : $to\n" if($DEBUG);
+	if( $from !~ /$config{frompattern}/i or $to !~ /$config{topattern}/i ) {
+		logprint "450 Failed - email addresses not authorised: $from -> $to\r\n";
+		return;
+	}
+	$tmpfile = $config{workdir}."/email.$$";
+	$section = 0; $inhead = 1; $TYPE = "";
+	open EMAIL,">$tmpfile" or do {
+		logprint "501 Failed to create temporary file\r\n";
+		return;
+	};
+	logprint "354 Start input now\r\n";
+	alarm(60); # shouldnt take more than a minute
+	while ($line = <STDIN>) {
+		last if($line =~ /^\.\s*$/ );
+		if(!$section) {
+			if($line =~ /boundary="(\S+)"/ ) { 
+				$mimesep = $1; 
+				print LOG "< Boundary: $mimesep\n" if($DEBUG);
+			}
+		}
+		if($inhead) {
+			if($line =~ /^\s*$/) { 
+				print LOG "< End of headers\n" if($DEBUG);
+				$inhead = 0; 
+				next;
+			}
+			if( !$TYPE and $line =~ /^\s*content-type\s*:.*(pdf|tif)/i ) {
+				$TYPE = $1; $indata = 1;
+				print LOG "< Section type is $TYPE\n" if($DEBUG);
+				next;
+			}
+			if( $line =~ /^\s*content-type\s*:\s*(\S+)/i ) {
+				print LOG "< Ignored section type $1\n" if($DEBUG);
+			}
+			next;
+		}
+		if($line =~ /^-*$mimesep/) { 
+			print LOG "< New section detected\n" if($DEBUG);
+			$section++; $inhead = 1; $indata = 0; next; 
+		}
+
+		if($indata and $TYPE) {
+			$data = decode_base64($line);
+			print EMAIL $data;
+		} else {
+			print LOG "< Ignored: $line" if($DEBUG);
+		}
+	}
+	alarm(0);
+	close EMAIL;
+	if($TYPE) {
+		$qid = dropoff($to,$tmpfile);
+		if(!$qid) {
+			logprint "501 Failed to store on server\r\n";
+		} else {
+			logprint "250 Ok: Stored as $qid.\r\n";
+		}
+	} else {
+		logprint "501 Failed to extract image file from mail\r\n";
+	}
+	unlink $tmpfile if( -f $tmpfile ); # tidy up
+}
+#############################################################################
+if($ARGV[0] and $ARGV[0] eq '-d') {
+	$DEBUG=1;
+}
+if(readconfig) {
+	logprint "500 Configuration file error.\r\n";
+	exit 0;
+}
+
+$SIG{ALRM} = \&timeout;
+alarm($config{smtptimeout});
+$|=1;
+open LOG, ">>".$config{logdir}."/smtp.log";
+autoflush LOG 1;
+print LOG "* Connection at ".localtime(time)."\n" if($DEBUG);
+sleep 1;
+logprint "220 ".$config{gatewayname}." SMTP gateway\r\n";
+while( 1 ) {
+	$cmd = <STDIN>;
+	print LOG "< $cmd" if($DEBUG);
+	$cmd  =~ s/[\n\r\s]+$//;
+	$cmd  =~ s/^[\n\r\s]+//;
+	$cmd = lc $cmd;
+	if($cmd =~ /^(ehlo|helo)/i) {
+		logprint "250 ".$config{gatewayname}." smtpdropoff Ver $VERSION\r\n";
+		next;
+	} elsif($cmd =~ /^rset/i) {
+		logprint "250 Ok\r\n";
+		next;
+	} elsif($cmd =~ /^quit/i) {
+		logprint "221 Bye\r\n";
+		last;
+	} elsif($cmd =~ /^mail from\s*:\s*(.*)/i) {
+		$from = $1;
+		$from = $1 if($from =~ /<(.*)>/); $from =~ s/\(.*\)//;
+		if( $from !~ /$config{frompattern}/i ) {
+			logprint "450 Failed - email address not authorised sender: $from\r\n";
+			$from = ""; $to = "";
+		} else {
+			logprint "250 Envelope sender Ok\r\n";
+		}
+		next;
+	} elsif($cmd =~ /^rcpt to\s*:\s*(.*)/i) {
+		$to = $1;
+		$to = $1 if( $to =~ /<(.*)>/ ); $to =~ s/\(.*\)//;
+		if($to !~ /@/) { $to .= '@'.$config{smtpdomain}; }
+		if( $to !~ /$config{topattern}/i ) {
+			logprint "550 Failed - email address not authorised recipient: $to\r\n";
+			$from = ""; $to = "";
+		} else {
+			logprint "250 Recipient Ok\r\n";
+		}
+		next;
+	} elsif($cmd =~ /^data/i ) {
+		alarm(0);
+		reademail;
+		next;
+	} elsif($cmd =~ /^help/i ) {
+		logprint "214-HELP command only partially implemented\r\n";
+		logprint "214 MAIL HELO RCPT QUIT RSET DATA EHLO HELP\r\n";
+		next;
+	} else {
+		logprint "502 Error: Command [$cmd] not implemented.\r\n";
+	}
+}
+print LOG "* End at ".localtime(time)."\n" if($DEBUG);
+exit 0;

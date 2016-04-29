@@ -1,0 +1,831 @@
+#!/usr/bin/perl -w
+# vim:ts=4
+#
+# Steve Shipway
+#
+# Version 1.3 : Added LDAP search for authenticated username, if given
+# version 1.4 : added remail authentication
+# version 1.5 : changed header text and email body
+# version 2.0 : global configuration file
+#         2.1 : only load LDAP if necessary
+#         2.2 : Allow multiple recipients
+#         2.3 : Improved notification email to remove confusion
+#         2.4 : Additional instructions for slow people
+#         2.5 : Fix the workdir for CGItemp files correctly
+#               Show pickup URL on confirmation
+#         2.6 : Sender notify
+
+use strict;
+use CGI;
+use Digest::MD5;
+use IO::Socket;
+use Sys::Hostname;
+
+my($VERSION) = "v2.5";
+
+# Configurable parameters...
+my($CONFIG) = "/u01/etc/dropoff.conf";
+# Add debug comments to generated pages?
+my($DEBUG) = 0;
+my($KEYLEN,$IVLEN,$CIPHER) = (56,8,"Blowfish");
+
+# Options to the CGI library
+#$CGITempFile::TMPDIRECTORY = "/u01/workspace";
+$CGI::POST_MAX = -1;
+#############################################################################
+# Globals
+my($q);
+my($authuser,%ldapinfo);
+
+my(%config) = ();
+sub readconfig() {
+	open CONFIG,"<$CONFIG" or return "Cannot open $CONFIG: $!";
+	while ( <CONFIG> ) {
+		chomp; next if( /^\s*#/ );
+		if( /^\s*(\S+)\s*=\s*(\S.*)/ ) { $config{lc $1} = $2; }
+	}
+	close CONFIG;
+	return 0;
+}
+sub dolog($) {
+	my($msg) = $_[0];
+	my(@now) = localtime(time);
+	my($date);
+    $now[1] = "0".$now[1] if($now[1]<10);
+	$date = $now[3]."/".($now[4]+1)."/".($now[5]+1900)." ".$now[2].":".$now[1];
+	open LOG, ">>".$config{logdir}."/dropoff.log" or return;
+	print LOG "$date\t$msg\n";
+	close LOG;
+}
+
+# Rename file to digest name: return new name, or null
+sub newname($) {
+	my($oldname) = $_[0];
+	my($newname);
+	my($file) = $config{dropdir}."/$oldname";
+	open(FILE, $file) or return "";
+	binmode(FILE);
+	$newname = Digest::MD5->new->addfile(*FILE)->hexdigest.".".(($$<<4)+$$);
+	rename($file, $config{dropdir}."/$newname") or return "";
+	return $newname;
+}
+
+# virus check the file: return 1 if infected, 0 if OK
+sub vcheck($) {
+	my( $response );
+	my( $vfile ) = $_[0]."\n";
+
+	$|=1;
+	if($config{sophie}) { # Do we want to check...
+		return "Sophie virus scanner is not running" if(! -w $config{sophie} );
+		socket(\*sock, AF_UNIX, SOCK_STREAM, 0) 
+			|| return "Couldn't create socket ($!)\n"; 
+		connect(\*sock, pack_sockaddr_un $config{sophie}) 
+			|| return "Sophie won't talk to me (".$config{sophie}.":$!)\n";
+		print "Virus scanning file...<BR>\n";
+		syswrite(\*sock, $vfile, length($vfile));
+		sysread(\*sock, $response, 256);
+		close(\*sock);
+
+		if ($response =~ m/^1/) {
+			if ($response =~ m/^1:.*$/) {
+   	 			my ($virus) = ($response =~ m/^1:(.*)$/);
+				return "Virus found in file: [$virus]";
+   	     	}
+			return "File is infected with a virus!";
+		} elsif ($response == -1) { 
+			return "Unknown status on virus check [$response]";
+		} 
+		print "... file scanned OK by Sophie [$response]<BR>\n";
+	}
+	if($config{clamav}) {
+		my($CMD);
+		return "ClamAV virus scanner is not running" if(! -w $config{clamav});
+		socket(\*sock, AF_UNIX, SOCK_STREAM, 0) 
+			|| return "Couldn't create socket ($!)\n"; 
+		connect(\*sock, pack_sockaddr_un $config{clamav}) 
+			|| return "Clamd won't talk to me (".$config{clamav}.":$!)\n";
+		print "Virus scanning file...<BR>\n";
+		$CMD="SCAN $vfile\n";
+		syswrite(\*sock, $CMD, length($CMD));
+		sysread(\*sock, $response, 256);
+		close(\*sock);
+        if ($response =~ m/(\S+)\s+FOUND$/) {
+			return "Virus found in file: [$1]";
+        }
+		print "... file scanned OK by ClamAV<BR>\n";
+	}
+	return 0;
+}
+
+# Get a response from the remote mail server (called by dorelease)
+sub readstatus($) {
+    my($sock) = shift;
+    my($stat, $resp, $first);
+    my($i) = 0;
+    my($rfd,$wfd,$xfd);
+    my($n,$t);
+
+    $rfd = $wfd = $xfd = "0";
+    vec($rfd,$sock,1)=1;
+    ($n,$t) = select( $rfd,$wfd,$xfd,$config{smtptimeout} );
+    if(!$n or !$rfd) { return (999,"Timeout"); }
+    $resp = <$sock> ;
+    $resp = "999 Timeout waiting for response" if(!$resp);
+    $stat = 0;
+    if( $resp =~ /^(\d\d\d)\s+(\S.*)/ ) { ($stat,$first) = ($1,$2); }
+    return ($stat,$first);
+}
+
+# send email to recipient of file: return 0 or error message
+sub notify($$$) {
+	my($to,$code,$pass) = @_;
+	my($file);
+	my($url,$sock,$c,$m);
+	my($svr,$id,$from,$msg,$subject);
+    my($filename);
+    my(@now) = localtime(time);
+    my($date);
+    my($size);
+    my(@sb);
+
+    $date = $now[3]."/".($now[4]+1)."/".($now[5]+1900)." ".$now[2].":".$now[1];
+
+    $file = "$code.$pass";
+    @sb = stat($config{dropdir}."/$file");
+    $size = $sb[7];
+
+    $filename = "filename.dat";
+    if( open(INFO, "<".$config{dropdir}."/$file.info") ) {
+        while( <INFO> ) {
+            chomp;
+            if( /^Content-Disposition:\s*(\S.*)/i ) { $filename = $1; last; }
+        }
+        close INFO;
+    }
+
+	$url = $config{pickupurl}."/$code";
+	$subject = "File ready for collection";
+	$subject = $q->param('subject') if($q->param('subject'));
+	$from = $config{mailfrom};
+	$from = $ldapinfo{email} if($ldapinfo{email});
+	if($q->param('from')) {
+		if($q->param('from')=~/<(\S+\@\S+)>/) { $from = $1;	}
+		elsif($q->param('from')=~/(\S+\@\S+)/) { $from = $1; }
+	}
+
+    # open conenction to SMTP server.  return error if failed.
+    $sock = new IO::Socket::INET(PeerAddr=>$config{smtpserver}, 
+		PeerPort=>$config{smtpport}, Proto=>'tcp');
+    if(!$sock) {
+		return "Cannot connect to server";
+    }
+#    fcntl($sock, F_SETFL(), O_NONBLOCK());
+    ($c,$m) = readstatus($sock); # get the welcome message
+	$m =~ /^(\S+)/; $svr = $1;
+
+    # send message envelope, check return codes
+    print $sock "HELO ".hostname()."\n";
+    ($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock;
+        return "Problem identifying myself ($c:$m)";
+    }
+    print $sock "MAIL FROM: <$from>\n";
+    ($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock; 
+        return "Problem with sender ($m)";
+    }
+
+  	print $sock "RCPT TO: <$to>\n";
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+   	     close $sock; 
+   	     return "Problem with recipient ($m)";
+    }
+
+    # Now send the message
+    print $sock "DATA\n";
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock; 
+        return "Problem sending data ($m)";
+    }
+
+	# send message
+	$msg = $q->param('msg'); $msg = "Please find attached file" if(!$msg);
+	if($ldapinfo{name}) {
+		print $sock "From: ".$ldapinfo{name}." <$from>\n";
+	} else {
+		print $sock "From: $from\n";
+	}
+    print $sock "To: $to\nSubject: [".$config{subject}."] $subject\nX-Mailer: UoA File dropoff\n\n";
+    print $sock "A file has been uploaded to the ".$config{organisation}." dropoff staging area for you.\n";
+	print $sock "This file will be available for pickup until "
+		.localtime(time+($config{keepdays}*24*3600))."\n\n"
+		if($config{keepdays});
+	print $sock "The file has been uploaded by ";
+	if($ldapinfo{name}) {
+		print $sock $ldapinfo{name};
+	} else {
+		print $sock $from;
+	}
+	print $sock ", with the following message:\n\n";
+
+    print $sock "-----------------------\n$msg\n-----------------------\n\n";
+    print $sock "To collect the file, use a web browser to go to the URL:\n";
+#   print $sock "$url and give the passcode '$pass'\n";
+    print $sock "$url/$pass\n\n";
+    print $sock "The URL above has to be pasted in one line, please ensure this is the case if your\n";
+    print $sock "e-mail client truncates it.\n\n";
+    print $sock "If you have trouble collecting your file when clicking on the above link, please instead right-click the link and choose 'Open in a new window', or cut-and-paste the URL into a new window.\n";
+    print $sock "\n".$config{message}."\n" if($config{message});
+    print $sock "\n\n";
+    print $sock "File information:\n";
+    print $sock "File name: $filename\n";
+    print $sock "File size: $size bytes\n";
+    print $sock "Uploaded at: $date\n";
+    print $sock "\n".$config{mailfromname}."\n";
+
+	# close
+	print $sock "\n.\n";
+
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+		close $sock; 
+        return "Problem sending message";
+    }
+	$m =~ /(\S+)\s*$/; $id = $1;
+	print $sock "QUIT\n";
+    close $sock;
+
+	print "Notification message sent to $to: $id\@$svr<br>\n";
+	dolog("SEND\t$authuser\t$code\t$pass\t$to\t$from\t$id\t$svr");
+
+	return 0; # success
+}
+
+# Send mail to arg1 telling them of code in arg2
+sub do_mailcode($$$$) {
+	my($to,$code,$pass,$filename) = @_;
+	my($file);
+	my($url,$sock,$c,$m);
+	my($svr,$id,$from,$msg,$subject);
+
+	$subject = "[".$config{subject}."] Authentication passcode for file dropoff";
+	$from = $config{mailfrom};
+
+    # open conenction to SMTP server.  return error if failed.
+    $sock = new IO::Socket::INET(PeerAddr=>$config{smtpserver}, 
+		PeerPort=>$config{smtpport}, Proto=>'tcp');
+    if(!$sock) {
+		return "Cannot connect to server";
+    }
+#    fcntl($sock, F_SETFL(), O_NONBLOCK());
+    ($c,$m) = readstatus($sock); # get the welcome message
+	$m =~ /^(\S+)/; $svr = $1;
+
+    # send message envelope, check return codes
+    print $sock "HELO ".hostname()."\n";
+    ($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock;
+        return "Problem identifying myself ($c:$m)";
+    }
+    print $sock "MAIL FROM: <$from>\n";
+    ($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock; 
+        return "Problem with sender ($m)";
+    }
+
+  	print $sock "RCPT TO: <$to>\n";
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+   	     close $sock; 
+   	     return "Problem with recipient ($m)";
+    }
+
+    # Now send the message
+    print $sock "DATA\n";
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock; 
+        return "Problem sending data. ($m)";
+    }
+
+	# send message
+	print $sock "From: $from\n";
+	print $sock "To: $to\nSubject: $subject\nX-Mailer: UoA File dropoff\n\n";
+	print $sock "You have successfully uploaded your file to the ".$config{organisation}."\n";
+	print $sock "web dropoff box.\n";
+
+	print $sock "\nThe file name is: $filename\n\n";
+
+	if($config{canexturl}) {
+		print $sock "In order to notify the intended recipient, you will\n";
+		print $sock "need to either complete the last web form, or else notify them yourself.\n";
+		print $sock "\nThe passcode for this file upload is:\n         $pass\n\n";
+		print $sock "You should enter this in the space provided on the form, or else inform\n";
+		print $sock "the intended recipient so that they can collect the file.\n";
+	} else {
+		print $sock "In order to notify the intended recipient, you MUST\n";
+		print $sock "complete the last web form, entering the passcode given below:\n";
+		print $sock "\nThe passcode for this file upload is:\n         $pass\n\n";
+		print $sock "You should enter this in the space provided on the form, and submit it in\n";
+		print $sock "order to inform the intended recipient so that they can collect the file.\n";
+	}
+
+	print $sock "\n".$config{mailfromname}."\n";
+
+	# close
+	print $sock "\n.\n";
+
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+		close $sock; 
+        return "Problem sending message";
+    }
+	$m =~ /(\S+)\s*$/; $id = $1;
+	print $sock "QUIT\n";
+    close $sock;
+
+	dolog("AUTHCODE\t$code\t$pass\t$to\t$from\t$id\t$svr");
+
+	return 0; # success
+}
+
+sub do_header {
+	my(%html);
+	print $q->header(-expires=>"now")."\n";
+	%html = (-title=>"File Dropoff",-bgcolor=>"#FFFFFF",
+		-leftmargin=>1, -topmargin=>0, -marginwidth=>1, -marginheight=>0 );
+	$html{-style}={src=>$config{stylesheet}} if($config{stylesheet});
+	print $q->start_html(%html)."\n";
+
+	if( $config{pageheaderdropoff} and -r $config{pageheaderdropoff} ) {
+		open HTML,"<".$config{pageheaderdropoff};
+		while(<HTML>) { print; }
+		close HTML;
+	}
+
+	if($ldapinfo{error}) {
+		print $q->b("LDAP Problem: ").$ldapinfo{error}.$q->br.$q->hr."\n";
+	}
+}
+
+sub do_footer {
+	if( $config{pagefooterdropoff} and -r $config{pagefooterdropoff} ) {
+		open HTML,"<".$config{pagefooterdropoff};
+		while(<HTML>) { print; }
+		close HTML;
+	}
+	print $q->end_html;
+}
+
+sub errorpage($) {
+	print $q->h1("Error Encountered");
+	print $q->p($_[0])."\n";
+	print $q->br.$q->hr."\n";
+#	print $q->p($q->a({href=>"javascript:window.history.go(-1);"},"Go back and try again"))."\n";
+	print $q->p($q->a({href=>$q->url()},"Restart from the beginning"))."\n";
+}
+
+sub do_redirect {
+	my($to,$hash,$code,$body,$subject);
+	my($url);
+
+	# is it valid?
+	$to = $q->param('to'); $to = '' if(!$to);
+	$hash = $q->param('hash');
+	$code = $q->param('code'); $code=$1 if($code and $code=~/(\d+)/);
+	$body = $q->param('msg');
+	$subject = $q->param('subject');
+	$subject = "File ready for collection" if(!$subject);
+	$body = "You can pick up the file from ".$config{pickupurl}."/$hash/$code" if(!$body);
+	if(!$hash or !$code) {
+		do_header;
+		errorpage "Problem with the redirect.";
+		do_footer;
+	}
+	$url = "mailto:$to?subject=".$q->escape($subject)."&body=".$q->escape($body);
+	print $q->redirect($url);
+}
+
+sub do_notify {
+	my($to,$from,$hash,$code,$rv,$rva);
+	my($topart,$notifysender);
+
+	$to = $q->param('to'); $to = 'blank' if(!$to);
+	$hash = $q->param('hash');
+	$code = $q->param('code'); $code=$1 if($code and $code=~/(\d+)/);
+
+	# extra params?
+	if(!$hash) {
+		errorpage "Invalid parameters passed.  What are you trying to do?";
+		return;
+	}
+
+	# Can we send this?
+	if(($config{novextext} and $authuser) or ($config{noextext} and !$authuser)) {
+		foreach $topart ( split /\s*[,;]\s*/,$to ) {
+			if(( $topart !~ /$config{domain}\s*$/ ) 
+			and ( $q->remote_host() !~ /^$config{subnet}/ )) {
+   			 	errorpage "Invalid recipient address $topart: You may not drop off files for external addresses unless you are located internally to the Organisation.";
+				return;
+			}
+		}
+	}
+	if( $to !~ /@/ ) {
+		errorpage "Invalid email address '$to' specified";
+		return;
+	}
+	if( ! -f $config{dropdir}."/$hash.$code" ) {
+		errorpage "Invalid Authentication Code specified.  Notification not sent.";
+		return;
+	}
+
+	# notify
+	$rv = "";
+	foreach $topart ( split /\s*[,;]\s*/,$to ) {
+		$rva = notify( $topart, $hash, $code );
+		$rv .= "<BR>" if($rv and $rva);
+		$rv .= $rva if($rva);
+	}
+	if($q->param('notifysender')) {
+		$from='';
+		if($q->param('from')) {
+			if($q->param('from')=~/<(\S+\@\S+)>/) { $from = $1;	}
+			elsif($q->param('from')=~/(\S+\@\S+)/) { $from = $1; }
+		}
+		$from = $ldapinfo{email} if( $ldapinfo{email} );
+		$rva = notify( $from, $hash, $code );
+		$rv .= "<BR>" if($rv and $rva);
+		$rv .= $rva if($rva);
+	}
+	if( $rv ) {
+		unlink $config{dropdir}."/$hash.$code" if($to !~ /[;,]/);
+		errorpage "Unable to send notification: $rv";
+		return;
+	}
+
+	# All done.
+	print $q->h1("Success");
+	print $q->p("The recipient has been emailed.\n");
+	print $q->p("The recipient can pick up the files from<BR>"
+		.$q->a({href=>($config{pickupurl}."/$hash/$code")},
+			$config{pickupurl}."/$hash/$code"));
+	print $q->p("This file will be available for pickup until "
+		.localtime(time+($config{keepdays}*24*3600)))."\n"
+		if($config{keepdays});
+	print $q->hr.$q->p($q->a({href=>$q->url()},"Upload another file"))."\n";
+	print $q->p($q->a({href=>$config{logouturl}},"Log out completely"))."\n" if($config{logouturl});
+	
+}
+
+sub do_upload {
+	my($f,$n,$fh,$rv);
+	my($fileinfo,$to,$topart,$from,$type,$filename,$hash,$code,$size);
+	my($body,$subject);
+	my($publickey) = 0;
+	my($dropfile);
+	my($cipher,$enc,$data,$iv,$key,$rsa);
+	my($encrypt) = 0;
+
+	$to = $q->param('to'); $to = 'blank' if(!$to);
+	$from = $q->param('from'); $from = '' if(!$from);
+	$from = $ldapinfo{email} if( $ldapinfo{email} );
+	$filename = $q->param('file');
+
+	# Can we upload this?
+	if(($config{novextext} and $authuser) or ($config{noextext} and !$authuser)) {
+		foreach $topart ( split /\s*[,;]\s*/,$to ) {
+			if(( $topart !~ /$config{domain}\s*$/ )
+			and ( $q->remote_host() !~ /^$config{subnet}/ )) {
+   			errorpage "Invalid recipient address $topart: You may not drop off files for external addresses unless you are located internally to the Organisation.";
+			return;
+			}
+		}
+	}
+	if( $to !~ /@/ ) {
+		errorpage "Invalid email address '$to' specified";
+		return;
+	}
+
+	# Can we encrypt it?
+	if( -r $config{keydir}."/$to.pub" ) {
+		# load in publickey, if we can.
+		require Crypt::RSA;
+		require Crypt::CBC;
+		$publickey = new Crypt::RSA::Key::Public(KF=>'SSH',
+            Filename=>($config{keydir}."/$to.pub"));
+		$rsa = new Crypt::RSA(ES=>'OAEP',KF=>'SSH');
+        $key = Crypt::CBC->random_bytes($KEYLEN);
+        $iv  = Crypt::CBC->random_bytes($IVLEN);
+        $data = $key.$iv;
+        $cipher = Crypt::CBC->new(-literal_key => 1, -cipher => $CIPHER,
+            -key => $key, -iv => $iv,
+            -header => 'none',
+            -keysize => $KEYLEN
+            );
+		$enc = $rsa->encrypt(Message=>$data,Key=>$publickey);
+		if($enc and $cipher and $publickey) { $encrypt = 1; }
+#		print "Encrypt: ".(unpack "H128",$data)."<BR>\n";
+	}
+
+	# upload file
+	if(!$q->param('file')) {
+    	errorpage "No file was uploaded!  Unable to store a nonexistant file...";
+		return;
+	}
+    $fh = $q->upload('file');
+    if (!$fh) {
+    	errorpage "File failed to upload: ".$q->cgi_error();
+		return;
+    }
+	binmode($fh); 
+	$f = "temp.$$";
+	$dropfile = $config{dropdir}."/$f";
+	open(OUT, ">$dropfile") or do {
+    	errorpage "Cannot create temporary file: $!";
+		return;
+	};
+	binmode(OUT);
+	while( <$fh> ) { print OUT; };
+	close $fh; close OUT;
+
+	# virus check
+	$rv = vcheck($dropfile);
+	if( $rv ) {
+		errorpage $rv;
+		dolog("VIRUS\t$authuser\t$to\t$from\t$f\t$rv");
+		unlink $dropfile;
+		return;
+	}
+
+	# Can we encrypt it?
+	if($encrypt) {
+		rename $dropfile,$dropfile.".x";
+		open ENC,">$dropfile";
+		print ENC $enc;
+		open IN,"<$dropfile.x";
+		$cipher->start('encrypting');
+        while( read( IN,$data,128 ) ) { print ENC $cipher->crypt($data); };
+        print ENC $cipher->finish;
+        close IN; close ENC;
+		unlink "$dropfile.x";
+		dolog("ENCRYPT\t$authuser\t$to\t$from\t$f");
+	}
+
+	$size = (stat $dropfile)[7]; # get size in bytes
+	if(!$size) {
+		unlink $dropfile;
+    	errorpage "An empty file was uploaded!  No point in storing this...";
+		return;
+	}
+
+	# rename
+	$n = newname($f);
+	if(!$n) {
+		unlink $dropfile;
+		errorpage "Unable to process file";
+		return;
+	}
+
+	$fileinfo = $q->uploadInfo($filename);
+	$filename =~ s/^.*[\/\\]//; # get the basename
+	if($fileinfo) { $type = $fileinfo->{'Content-Type'}; $type = 'application/binary' if(!$type);}
+	if( open INFO, ">".$config{dropdir}."/$n.info" ) {
+		print INFO "Content-Type: $type\n" if($type);
+		print INFO "Content-Disposition: $filename\n" if($filename);
+		print INFO "Origin: CGI".($authuser?"-AUTH":"")
+			.($encrypt?"-XXXX":"")."\n";	
+		print INFO "Size: $size\n";
+		print INFO "Notified: ".localtime()."\n";
+		print INFO "Encrypted: ".($encrypt?"yes":"no")."\n";
+		print INFO "AuthUser: $authuser\n" if($authuser);
+		print INFO "Sender: ".$ldapinfo{email}."\n" if($ldapinfo{email});
+		print INFO "Recipient: $to\n" if($to);
+		print INFO "ClientIP: ".$q->remote_host()."\n";
+		close INFO;
+	}
+
+	# All ok
+	$n =~ /(\S+)\.(\d+)/;  ($hash,$code)=($1,$2);
+	$subject="File $filename is ready for collection";
+	$body="The file $filename has been uploaded for you to collect.";
+#  You can pick it up from\n".$config{pickupurl}."/$hash/$code";
+	print $q->h1("Upload received");
+	print "<font color=red>".$q->p($q->b("Warning:")." The file is not yet available to the recipient!\n")."</font>";
+	if(!$ldapinfo{email} and $config{mailcheck} and !$authuser ) {
+		print $q->p("First, you will need to keep this page open while you check your email. Then put the authentication code (this has just been emailed to you) into the Authentication code field on this page.\n");
+	}
+    if( ($size < 10240000) and ($filename !~ /\.(zip|exe)$/ ) ) { # 10Mb
+        print $q->p("Note: Your file is under 10Mb in size, and does not appear to be an executable, so you could possibly have emailed it as an attachment.\n");
+    }
+	print $q->p("This file will be available for pickup until "
+		.localtime(time+($config{keepdays}*24*3600)))."\n"
+		if($config{keepdays});
+	print $q->p("The file has been uploaded, and checked for viruses.  To notify the intended recipient, please choose one of the following options:\n");
+	print $q->start_form(-name=>'fnotify',-method=>'POST',-action=>$q->url())
+		."<TABLE align=center border=0 cellspacing=2 cellpadding=1 bgcolor=#eeffee>\n";
+	if($authuser) {
+		print "<TR><TD><b>Your authenticated UPI:</b></TD><TD>$authuser";
+		print " (".$ldapinfo{name}.")" if($ldapinfo{name});
+		print "</TD></TR>\n" ;
+	}
+	print "<TR><TD><b>Email address of recipient:</b></TD><TD>"
+		.$q->hidden(-name=>'to', -value=>"$to")."$to"
+		.($encrypt?" <I>(encrypted)</I>":"")
+		."</TD></TR>\n";
+#		.$q->textfield(-name=>'to', -value=>'',-size=>40)."</TD></TR>\n";
+	print "<TR><TD><b>Your email address:</b></TD><TD>";
+	if($ldapinfo{email}) {
+		print '"'.$ldapinfo{name}.'" ' if($ldapinfo{name});
+		print $ldapinfo{email}
+			.$q->hidden(-name=>'from', -value=>$ldapinfo{email});
+		print $q->hidden(-name=>'code', -value=>"$code");
+		print "</TD></TR>"
+			."<TR><TD><b>Send you a notification also?:</b></TD><TD>"
+			.$q->checkbox(-name=>'notifysender',-checked=>0,-value=>1,-label=>'')."\n";
+	} elsif( $config{mailcheck} and !$authuser ) {
+		print $from.$q->hidden(-name=>'from', -value=>$from);
+		print "</TD></TR>"
+			."<TR><TD><b>Send you a notification also?:</b></TD><TD>"
+			.$q->checkbox(-name=>'notifysender',-checked=>0,-value=>1,-label=>'')."\n";
+		print "</TD></TR>\n<TR><TD>";
+		$rv = do_mailcode($from,$hash,$code,$filename) ;
+		if($rv) {
+			print "<b>Error sending authentication code</b></TD><TD>$rv</TD></TR>\n<TR><TD>";
+		} 
+		print "<b><font color=red>Authentication code</font>:</b><br><small>This has just been emailed to you</small></TD><TD>";
+		print $q->textfield(-name=>'code', -value=>'',-size=>10);
+	} else {
+		print $q->textfield(-name=>'from', -value=>$from,-size=>40);
+		print $q->hidden(-name=>'code', -value=>"$code");
+		print "</TD></TR>"
+			."<TR><TD><b>Send you a notification also?:</b></TD><TD>"
+			.$q->checkbox(-name=>'notifysender',-checked=>0,-value=>1,-label=>'')."\n";
+	}
+	print "</TD></TR>\n";
+	print "<TR><TD><b>Email subject:</b></TD><TD>"
+		.$q->textfield(-name=>'subject', -value=>$subject,-size=>40)."</TD></TR>\n";
+	print "<TR><TD valign=top><b>Message to recipient:</b></TD><TD>"
+		.$q->textarea(-name=>'msg', -value=>$body, -rows=>10,-cols=>40)."</TD></TR>\n";
+	print "<TR><TD></TD><TD>"
+		.$q->hidden(-name=>'hash', -value=>"$hash")
+		.$q->submit(-name=>'notify', -value=>'Send email to notify recipient',
+			-onClick=>'if( code.value == "") { alert("Please enter the Authentication Code"); return false; }')."</TD></TR>\n";
+	print "</TABLE>".$q->end_form()."\n";
+
+	if($authuser) {
+		print $q->h2("OR");
+		print $q->p("Inform the recipient yourself that it can be downloaded from the following URL:<BR>\n"
+			.$q->a({href=>$config{pickupurl}."/$hash/$code"},$config{pickupurl}."/$hash/$code")."\n");
+	} elsif($config{canexturl}) {
+		print $q->h2("OR");
+		print $q->p("Inform the recipient yourself that it can be downloaded from the following URL, if they give the Authentication code that we have mailed to you:<BR>\n"
+			.$q->a({href=>$config{pickupurl}."/$hash"},$config{pickupurl}."/$hash")."\n");
+	}
+#		.$config{pickupurl}."/$1<BR>\n"
+#		."by giving the passcode '$2'");
+#	print $q->hr.$q->p($q->a({href=>$q->url()},"Upload another file"))."\n";
+	if($config{logouturl}) {
+	print $q->h2("OR");
+	print $q->p($q->a({href=>$config{logouturl}},"Cancel message and log out completely"))."\n";
+	}
+
+	dolog("RECV\t$authuser\t$hash\t$code\t$to\t$from\t$filename\t".$q->remote_host());
+	
+}
+
+# Create the form for file upload
+# Fields: to, msg, file, go (submit button)
+sub do_form {
+
+	print $config{caution}."\n" if($config{caution});
+
+	print $q->start_multipart_form(-method=>'POST',-action=>$q->url())
+		."<TABLE align=center border=0 cellspacing=2 cellpadding=1 bgcolor=#eeffee>\n";
+	
+	if($authuser) {
+		print "<TR><TD><b>Your authenticated UPI:</b></TD><TD>$authuser";
+		print " (".$ldapinfo{name}.")" if($ldapinfo{name});
+		print "</TD></TR>\n" ;
+	}
+	if($ldapinfo{email}) {
+		print "<TR><TD><b>Your email address:</b></TD><TD>"
+			.$ldapinfo{email}."</TD></TR>\n";
+	} elsif( $config{mailcheck} ) {
+		print "<TR><TD><b>Your email address:</b></TD><TD>"
+			.$q->textfield(-name=>'from', -value=>'',-size=>40)."</TD></TR>\n";
+	}
+	print "<TR><TD><b>Email address of recipient:</b></TD><TD>"
+		.$q->textfield(-name=>'to', -value=>'',-size=>40)."</TD></TR>\n";
+#	print "<TR><TD valign=top>Message to recipient</TD><TD>"
+#		.$q->textarea(-name=>'msg',-value=>'This file has been uploaded for you to collect.',
+#		-rows=>10,-cols=>40)."</TD></TR>\n";
+	print "<TR><TD><b>File to upload:</b></TD><TD>"
+		.$q->filefield(-name=>'file')."</TD></TR>\n";
+	print "<TR><TD></TD><TD>"
+		.$q->submit(-name=>'go', -value=>'Upload this file')."</TD></TR>\n";
+
+	print "</TABLE>".$q->end_form()."\n";
+}
+
+#########################################################################
+# Find out everything we can from LDAP
+# This will be the username and maybe email address, if possible.
+sub ldap_fetch {
+	my($mesg,$ldap,$entry,$v);
+
+	%ldapinfo = ( name=>"", email=>"" ); 
+	return if(!$authuser);
+
+	if($config{ldapserver}) {
+    eval {
+		require Net::LDAP;
+	    alarm($config{ldaptimeout}+1);
+   		$ldap = Net::LDAP->new( $config{ldapserver}, timeout=>$config{ldaptimeout}, version=>3 );
+   		alarm(0);
+    };
+    if( !$ldap or $@ ) {
+		$ldapinfo{error} = "Unable to connect to server: $@"; return;
+    }
+	if( $config{ldaptls} ) {
+		eval {
+   	 	alarm($config{ldaptimeout}+1);
+   	 	$mesg = $ldap->start_tls(  );
+   	 	alarm(0);
+   	 };
+   	 if($@) {
+			$ldapinfo{error} = "Timeout on TLS connect [$@]"; return;
+   	 } elsif($mesg->code) {
+			$ldapinfo{error} = "TLS connect failed:".$mesg->error; 
+			return;
+	    }
+	}
+	$mesg = $ldap->bind( $config{binddn}, password =>$config{bindpassword} );
+    if($mesg->code) {
+		$ldapinfo{error} = "LDAP bind failed:".$mesg->error; return;
+    } 
+    $mesg = $ldap->search( base => $config{basedn},
+        sizelimit => 1, timelimit => $config{ldaptimeout}, filter=>"(cn=$authuser)" );
+    if($mesg->code) {
+		$ldapinfo{error} = "LDAP search failed:".$mesg->error; return;
+    }
+	$entry = $mesg->entry(0);
+	if($entry) {
+		$v = $entry->get_value("displayName");
+		$ldapinfo{name} = $v if($v);
+		$v = $entry->get_value("mail");
+		$ldapinfo{email} = $v if($v);
+	} else {
+		$ldapinfo{error} = "User not found in LDAP.";
+	}
+    $mesg = $ldap->unbind;   # take down session
+	} # EC
+	if( $config{maildomain} ) {
+		if( ! $ldapinfo{email} ) {
+			$ldapinfo{email} = "$authuser\@".$config{maildomain};
+		}
+		if( ! $ldapinfo{name} ) { $ldapinfo{name} = $authuser; }
+	}
+
+}
+
+#########################################################################
+# MAIN
+
+readconfig;
+$CGITempFile::TMPDIRECTORY = $config{workdir} if($config{workdir});
+$CGI::POST_MAX=$config{maxsize} if($config{maxsize});
+
+$q = new CGI;
+$authuser = $q->remote_user();
+$authuser = "" if(!$authuser);
+
+ldap_fetch;
+
+
+# Have we been given a form?
+if($q->param('go')) {
+	do_header;
+	do_upload;
+	do_footer;
+} elsif($q->param('notify')) {
+	do_header;
+	do_notify;
+	do_footer;
+} elsif($q->param('mailto')) {
+	do_redirect;
+} else {
+	do_header;
+	do_form;
+	do_footer;
+}
+
+
+
+exit 0;

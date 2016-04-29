@@ -1,0 +1,61 @@
+Installing WebDropoff
+
+This is a very quick set of instructions to install the WebDropoff software. 
+It assumes that you have already installed your web server, and Perl.
+
+0. Install Perl modules.
+   If you are going to use encryption, make sure you have installed
+   Crypt::RSA, Crypt::CBC, Crypt::Blowfish
+1. Create data directories.
+   You need a workspace dir, a public keys dir, a dropoff dir, and a logs dir.
+   All of these must be writeable by the web server CGI scripts.
+   You also need an etc dir.  This must not be writeable.
+2. Install and modify templates.
+   Copy the *.inc files to the etc directory.  These are the templates for the
+   web page headers and footers, so modify them as you like.
+3. Install dropoff.conf and configure
+   Copy the dropoff.conf file to the etc directory.  Go therough the file and 
+   make any necessary configuration changes, especially the file locations
+   and future pickup URL.
+4. Update the dropoff, pickup, waiting, smtpdropoff, makekeypair, and
+   cleandropoff files to give the location of the dropoff.conf file.  Update 
+   the xpickup.pl to give the URL of the pickup script.
+5. Install the dropoff, pickup, makekeypair and waiting scripts into your 
+   web server's cgi-bin.  
+   The waiting script MUST be password protected to just administrators.
+   The pickup script should NOT be password protected.
+   The dropoff script you can install twice if required, once password
+   protected, and once not.  It will act appropriately in both cases.
+   The makekeypair script can also be installed in two places, one of them
+   password protected.  This way, your local users can use the password
+   protected versions and bypass the email address verification step.
+6. Copy the xpickup.exe and/or xpickup.pl scripts to workstations which 
+   require remote private-key decryption/pickup facility. (Optional). If you
+   use xpickup.pl then you will need ActivePerl 5.8 or later with the
+   Crypt::RSA, Crypt::CBC, Crypt::SSLeay modules installed.
+7. Move the cleandropoff script to your sbin directory, and then add it to
+   the root crontabs, to run nightly.
+8. Optionally, install the smtpdropoff file in your sbin directory, and add
+   the xinetd information provided so that it can accept dropoffs via SMTP
+   mail attachments.  Usually used for scan-to-email systems.
+
+Now, you can use the scripts remotely from your web browser.
+
+Optionally use the makekeypair to generate a public/private keypair tied to
+your email address which will be used for future dropoffs for you.
+
+Use the dropoff script to drop a file for pickup according to the security
+rules you defined in the dropoff.conf.
+
+Use the pickup script to collect files, accoring to the URL emailed in the 
+notification emails sent when a file is dropped off.
+
+The cleandropoff script will clean the dropoff.log and dropoff directory
+according to the limits set in the dropoff.conf file.
+
+Any problems?
+Check the error log of your web server, and run the scripts interactively.
+Make sure you have all the options defined in the dropoff.conf
+s.shipway@auckland.ac.nz
+http://www.steveshipway.org/forum
+Steve Shipway, Univeristy of Auckland

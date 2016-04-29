@@ -1,0 +1,5 @@
+2.6:
+* Strip whitespace from Authcode in form to prevent unexplained errors for users
+* Pickup changed to get confirmation when about to delete file, to get around
+  issues with antivirus s/w and gmail which pre-check URLs
+

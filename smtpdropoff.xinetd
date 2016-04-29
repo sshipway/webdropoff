@@ -1,0 +1,15 @@
+# default: on
+# description: Ricoh email scan feed
+service smtp
+{
+       	flags           = REUSE
+        socket_type     = stream        
+       	wait            = no
+        user            = apache
+	group           = apache
+       	server          = /usr/local/bin/smtpdropoff
+#       server_args     =  -d
+	log_on_success	=
+#       log_on_failure  += USERID
+        disable         = no
+}

@@ -1,0 +1,374 @@
+#!/usr/bin/perl
+#
+# vim:ts=4
+#
+# Create a key pair, put the public in a pending file, and send the private
+#
+##########################################################################
+
+use strict;
+use CGI;
+use Crypt::RSA;
+use IO::Socket;
+use Sys::Hostname;
+
+##########################################################################
+# Set this to point to your dropoff.conf file
+
+my($CONFIG) = "/u02/etc/dropoff.conf";
+
+##########################################################################
+my($PASSWORD) = "";
+my($q) = new CGI;
+my($UPI) = $q->remote_user();
+my(%config) = ();
+my($VALID) = 0;
+my($ADDR,$NAME) = ("","");
+my($MAXAGE) = 30; # max minutes you can take to enter authentication code
+my($VERSION) = "2.1";
+
+sub readconfig() {
+	open CONFIG,"<$CONFIG" or return "Cannot open $CONFIG: $!";
+	while ( <CONFIG> ) {
+		chomp; next if( /^\s*#/ );
+		if( /^\s*(\S+)\s*=\s*(\S.*)/ ) { $config{lc $1} = $2; }
+	}
+	close CONFIG;
+	return 0;
+}
+
+sub dofooter() {
+    if( $config{pagefootermakekeypair} and -r $config{pagefootermakekeypair} ) {
+        open HTML,"<".$config{pagefootermakekeypair};
+        while(<HTML>) { print; }
+        close HTML;
+    }
+	print $q->end_html();
+}
+sub doheader() {
+    my(%html);
+    print $q->header(-expires=>"now")."\n";
+    %html = (-title=>"Key Pair Creation",-bgcolor=>"#FFFFFF",
+        -leftmargin=>1, -topmargin=>0, -marginwidth=>1, -marginheight=>0 );
+    $html{-style}={src=>$config{stylesheet}} if($config{stylesheet});
+    print $q->start_html(%html)."\n";
+
+    if( $config{pageheadermakekeypair} and -r $config{pageheadermakekeypair} ) {
+        open HTML,"<".$config{pageheadermakekeypair};
+        while(<HTML>) { print; }
+        close HTML;
+    }
+}
+
+sub errorpage($) {
+	doheader;
+	print $q->h1("ERROR");
+	print $q->p($_[0]);
+	print $q->hr.$q->a({href=>$q->url()},"Try again");
+	dofooter;
+	exit 0;
+}
+
+sub deletekey {
+	my($k);
+
+	unlink $config{keydir}."/$UPI.pub" if($UPI);
+	unlink $config{keydir}."/$ADDR.pub" if($ADDR);
+
+	unlink $config{workdir}."/".$q->param('C')."-$ADDR"
+		if($q->param('C'));
+
+	doheader;
+	print $q->h1("DELETED");
+	print "The stored public key for $ADDR has been deleted.<P>\n";
+	print $q->hr.$q->a({href=>$q->url()},"Generate new key");
+	dofooter;
+	exit 0;
+}
+
+# Ask for user's details for verification, if we can't authenticate.
+sub verifypage {	
+	doheader;
+	print $q->h1("Key generator");
+	print $q->p("Before creating a key pair, we need to verify your email address and identity.  To do this, an email will be sent to your given address containing a verification code.  On the next form, you will need to enter this code in order to proceed.");
+	print "<HR><FORM method=POST action=".$q->url()."><CENTER><TABLE border=0>";
+	print "<TR><TD><B>Email Address:</B></TD><TD>"
+		."<INPUT name=A value='' size=30></TD></TR>\n"; 
+	print "<TR><TD><B>Name:</B></TD><TD>"
+		."<INPUT name=N value='' size=30></TD></TR>\n";
+	print "<TR><TD></TD><TD>"
+		."<INPUT type=submit name=V value='Verify my address'>";
+	print "</TD></TR></TABLE></CENTER></FORM>\n";
+	dofooter();
+	exit 0;
+}
+
+sub ldapfetch {
+	my($addr,$name) = ("","");
+	my($ldap,$mesg,$entry,$v);
+
+	if($UPI and $config{ldapserver}) {
+    eval {
+		require Net::LDAP;
+        alarm($config{ldaptimeout}+1);
+        $ldap = Net::LDAP->new( $config{ldapserver}, timeout=>$config{ldaptimeout}, version=>3 );
+        alarm(0);
+    };
+    if( !$ldap or $@ ) {
+        return("Unable to connect to server: $@","");
+    }
+
+	if( $config{ldaptls} ) {
+    eval {
+        alarm($config{ldaptimeout}+1);
+        $mesg = $ldap->start_tls(  );
+        alarm(0);
+    };
+    if($@) {
+        return("Timeout on TLS connect [$@]","");
+    } elsif($mesg->code) {
+        return("TLS connect failed:".$mesg->error,"");
+    }
+	}
+    $mesg = $ldap->bind( $config{binddn}, password =>$config{bindpassword} );
+	if($mesg->code) {
+        return("LDAP bind failed:".$mesg->error,"");
+    }
+    $mesg = $ldap->search( base => $config{basedn},
+        sizelimit => 1, timelimit => $config{ldaptimeout}, filter=>"(cn=$UPI)" );
+    	if($mesg->code) {
+       		return("LDAP search failed:".$mesg->error,"");
+    	}
+    	$entry = $mesg->entry(0);
+		$mesg = $ldap->unbind;   # take down session
+    	if($entry) {
+       		$v = $entry->get_value("displayName");
+			$name = $v if($v);
+    	    $v = $entry->get_value("mail");
+    	    $addr = $v if($v);
+    	} else {
+    	    return("User not found in LDAP.","");
+	   	}
+		$VALID = 1; # we believe you!
+	} elsif($UPI and $config{maildomain}) {
+		($name,$addr) = ( $UPI, "$UPI\@".$config{maildomain} );
+		$VALID = 1; # we believe you!
+	} elsif( $q->param('C') and $q->param('A')
+		and -f $config{workdir}."/".$q->param('C')."-".$q->param('A') ) {
+		my(@s) = stat $config{workdir}."/".$q->param('C')."-".$q->param('A');
+		if( (time-$s[9])>($MAXAGE*60) ) {
+			unlink $config{workdir}."/".$q->param('C')."-".$q->param('A');
+			errorpage("Authorisation file too old!");
+		}
+		$name = $addr = $q->param('A');
+		$name = $q->param('N') if($q->param('N'));
+		# we know for sure because its verified
+		$VALID = 1;
+	} elsif( $q->param('A') 
+		and $q->param('A') =~ /(\S+\@\S+)/) {
+		# we've been told, but its not been verified
+		$name = $addr = $1; # just the email address
+		$name = $q->param('N') if($q->param('N'));
+	} else {
+		# we dont even have a guess, so we need to prompt for verification
+		verifypage;	
+		exit 0;
+	}
+	return($name,$addr);
+}
+
+# Get a response from the remote mail server (called by dorelease)
+sub readstatus($) {
+    my($sock) = shift;
+    my($stat, $resp, $first);
+    my($i) = 0;
+    my($rfd,$wfd,$xfd);
+    my($n,$t);
+
+    $rfd = $wfd = $xfd = 0;
+    vec($rfd,$sock,1)=1;
+    ($n,$t) = select $rfd,$wfd,$xfd,$config{smtptimeout}; # 10 sec timeout
+    if(!$n or !$rfd) { return (999,"Timeout"); }
+    $resp = <$sock> ;
+    $resp = "999 Timeout waiting for response" if(!$resp);
+    $stat = 0;
+    if( $resp =~ /^(\d\d\d)\s+(\S.*)/ ) { ($stat,$first) = ($1,$2); }
+    return ($stat,$first);
+}
+# Send an email to this person with the activation code.
+sub donotify($$) {
+	my($to,$code) = @_;
+	my($c,$m,$sock,$svr);
+	my($from,$subject);
+
+	$from = "webdropoff@".$config{maildomain};
+	$from = $config{mailfrom} if($config{mailfrom});
+
+	$subject = "Private Key generator authentication";
+
+    # open conenction to SMTP server.  return error if failed.
+    $sock = new IO::Socket::INET(PeerAddr=>$config{smtpserver}, 
+		PeerPort=>$config{smtpport}, Proto=>'tcp');
+    if(!$sock) {
+		return "Cannot connect to server";
+    }
+#    fcntl($sock, F_SETFL(), O_NONBLOCK());
+    ($c,$m) = readstatus($sock); # get the welcome message
+	$m =~ /^(\S+)/; $svr = $1;
+
+    # send message envelope, check return codes
+    print $sock "HELO ".hostname()."\n";
+    ($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock;
+        return "Problem identifying myself";
+    }
+    print $sock "MAIL FROM: <$from>\n";
+    ($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock; 
+        return "Problem with sender email address";
+    }
+
+  	print $sock "RCPT TO: <$to>\n";
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+   	     close $sock; 
+   	     return "Problem with recipient email address";
+    }
+
+    # Now send the message
+    print $sock "DATA\n";
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock; 
+        return "Problem sending data.";
+    }
+
+	# send message
+	print $sock "From: $from\n";
+	print $sock "To: $to\nSubject: $subject\nX-Mailer: UoA File dropoff\n\n";
+	print $sock "In order to authenticate your email address to the ".$config{organisation}."\n";
+	print $sock "web dropoff box, you need to provide an authentication code.  This will allow\n";
+	print $sock "you to create a Public/Private keypair for file encryption.\n\n";
+	print $sock "The authentication code you need to provide is:\n         $code\n\n";
+	print $sock "You should enter this in the space provided on the form.\n";
+	print $sock "If you did not attempt to generate a keypair, then someone else is attempting\n";
+	print $sock "to pretend to be you.  You can ignore this message.\n";
+	print $sock "\n".$config{mailfromname}."\n";
+
+	# close
+	print $sock "\n.\n";
+
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+		close $sock; 
+        return "Problem sending message";
+    }
+#	$m =~ /(\S+)\s*$/; $id = $1;
+	print $sock "QUIT\n";
+    close $sock;
+
+	return 0;
+}
+
+sub makekey {
+	my($public, $private);
+	my($rsa) = new Crypt::RSA( ES=>'OAEP' );
+	my($file)= $config{keydir}."/key.pub";
+
+	if(!$ADDR) { errorpage("LDAP error: $NAME"); exit(0); }
+
+	# Make the key
+	($public, $private) = $rsa->keygen (
+		Identity => $NAME,
+		Size      => 1024,
+		Password => $PASSWORD,
+		Verbosity => 0
+	);
+	if(!$public or !$private) { 
+		errorpage("Cannot generate keys: ".$rsa->errstr ); exit 0; 
+	}
+	if($ADDR) { $file = $config{keydir}."/$ADDR.pub"; }
+	if($UPI) { $file = $config{keydir}."/$UPI.pub"; }
+	$public->write(Filename=>$file) or do { 
+		errorpage("Cannot create publickey file: ".$public->errstr); exit 0; 
+	};
+	if($ADDR and $UPI) { 
+		unlink $config{keydir}."/$ADDR.pub"; # probably will fail
+		symlink "$UPI.pub",$config{keydir}."/$ADDR.pub"; 
+	}
+	# remove authentication file if it exists
+	unlink $config{workdir}."/".$q->param('C')."-$ADDR"
+		if($q->param('C'));
+
+	# Now output the key.
+	print $q->header('-expires'=>'now','-type'=>'application/octet-stream; filename=\"private.key\"',
+		'-Content-Disposition'=>"filename=\"private.key\"");
+	binmode(STDOUT);
+	print $private->serialize;
+	exit 0;
+}
+
+sub makepage {
+	if(!$VALID) {
+		# we need to send a verification email, and create the file
+		my($rv,$code);
+		$code = rand(65535);
+		$code = ($code<<16)|rand(65535);
+		$code = ($code<<16)|rand(65535);
+		$code = ($code<<16)|rand(65535);
+		$code = unpack "H16",$code; # 16 random hex digits.  Will have to do.
+		open CODE,">".$config{workdir}."/$code-$ADDR" or do {
+			errorpage("Cannot create code file: $!");
+		};
+		print CODE time; # timestamp for code file
+		close CODE;
+		$rv = donotify($ADDR,$code);	
+		if($rv) {
+			errorpage("Cannot send authentication email: $rv");
+		}
+	}
+	doheader;
+	print $q->h1("Key generator");
+	print $q->p("This will generate a public/private key pair.  You can optionally specify a password with which to lock the private key.  After generation, the public key will remain on the Dropoff server in a pending directory, and the Private key will be downloaded to your machine.  No copy of the private key will be kept on the Dropoff server.");
+	print "<HR><FORM method=POST action=".$q->url()."><CENTER><TABLE border=0>";
+	if($UPI) {
+		print "<TR><TD><B>Username:</B></TD><TD>$UPI</TD></TR>\n";
+	} else {
+		print "<TR><TD><B>Verification Code:</B></TD><TD>"
+			."<INPUT name=C size=32 value=''></TD></TR>\n";
+	}
+	print "<TR><TD><B>Address:</B></TD><TD>$ADDR"
+		."<INPUT type=hidden name=A value=$ADDR>"
+		."</TD></TR>\n" if($ADDR);
+	print "<TR><TD><B>Name:</B></TD><TD>$NAME"
+		."<INPUT type=hidden name=N value=$NAME>"
+		."</TD></TR>\n" if($NAME);
+	print "<TR><TD><B>Optional Password:</B></TD><TD><INPUT type=PASSWORD name=P size=32 value=''></TD></TR>";
+	print "<TR><TD><B>Again:</B></TD><TD><INPUT type=PASSWORD name=P2 size=32 value=''></TD></TR>";
+	print "<TR><TD></TD><TD>"
+		."<INPUT type=submit name=G value='Generate the key pair'>";
+	print "<INPUT type=submit name=D value='Delete existing key'>"
+		if( ($UPI and -f $config{keydir}."/$UPI.pub") 
+			or -f $config{keydir}."/$ADDR.pub" );
+	print "</TD></TR></TABLE></CENTER></FORM>\n";
+	dofooter;
+}
+
+# Load configuration
+my( $rv ) = readconfig;
+errorpage($rv) if($rv);
+
+# Work out who we (say) we are
+($NAME,$ADDR) = ldapfetch;
+
+# Did we pass a password?
+if($q->param('P')) {
+	$PASSWORD = $q->param('P');
+	if($PASSWORD ne $q->param('P2')) { errorpage("Passwords do not match"); exit(0); }
+}
+if($q->param('G') and $VALID) { makekey; exit 0; }
+if($q->param('D') and $VALID) { deletekey; exit 0; }
+makepage; # default
+exit 0;

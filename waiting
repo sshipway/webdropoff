@@ -1,0 +1,444 @@
+#!/usr/bin/perl
+# vim:ts=4
+# Show all files waiting pickup
+#
+# S Shipway, University of Auckland, 2007
+#
+# Version 2.0: Encryption aware
+#         2.1: can renotify of passcodes
+
+use strict;
+use CGI;
+use IO::Socket;
+use Sys::Hostname;
+
+# Set this to the location of the configuration file
+my($CONFIG) = "/u01/etc/dropoff.conf";
+
+my($VERSION) = "2.1";
+
+my($CMD,@FILES);
+my($q) = new CGI;
+my(%files) = ();
+
+# default sort - reverse date
+my($reverse) = 1;
+my($smethod) = 3; # filename=1, size=2, date=3, from=4
+
+
+my(%config) = ();
+
+sub readconfig() {
+	open CONFIG,"<$CONFIG" or return "Cannot open $CONFIG: $!";
+	while ( <CONFIG> ) {
+		chomp; next if( /^\s*#/ );
+		if( /^\s*(\S+)\s*=\s*(\S.*)/ ) { $config{lc $1} = $2; }
+	}
+	close CONFIG;
+	return 0;
+}
+sub bywhatever {
+	my($sa,$sb);
+
+	($sa,$sb) = ($a,$b);
+
+	if( $smethod == 1 ) {
+		$sa = $files{$a}{filename};
+		$sb = $files{$b}{filename};
+	} elsif( $smethod == 2 ) {
+		$sa = $files{$a}{rawsize};
+		$sb = $files{$b}{rawsize};
+		if($reverse) {
+			return ($sb <=> $sa);
+		} else {
+			return ($sa <=> $sb);
+		}
+	} elsif( $smethod == 3 ) {
+		$sa = $files{$a}{rawdate};
+		$sb = $files{$b}{rawdate};
+	} elsif( $smethod == 4 ) {
+		$sa = $files{$a}{from};
+		$sb = $files{$b}{from};
+	}
+
+	if($reverse) {
+		$sb cmp $sa;
+	} else {
+		$sa cmp $sb;
+	}
+}
+
+# Get a response from the remote mail server (called by dorelease)
+sub readstatus($) {
+    my($sock) = shift;
+    my($stat, $resp, $first);
+    my($i) = 0;
+    my($rfd,$wfd,$xfd);
+    my($n,$t);
+
+    $rfd = $wfd = $xfd = 0;
+    vec($rfd,$sock,1)=1;
+    ($n,$t) = select $rfd,$wfd,$xfd,$config{smtptimeout}; # 10 sec timeout
+    if(!$n or !$rfd) { return (999,"Timeout"); }
+    $resp = <$sock> ;
+    $resp = "999 Timeout waiting for response" if(!$resp);
+    $stat = 0;
+    if( $resp =~ /^(\d\d\d)\s+(\S.*)/ ) { ($stat,$first) = ($1,$2); }
+    return ($stat,$first);
+}
+
+sub doreminder($) {
+	my($f) = $_[0];
+	my($to,$code,$pass) = ($files{$f}{to},$files{$f}{filecode},$files{$f}{passcode});
+	my($file);
+	my($url,$sock,$c,$m);
+	my($svr,$id,$from,$msg,$subject);
+    my($filename);
+    my(@now) = localtime(time);
+    my($date);
+    my($size);
+    my(@sb);
+
+    $date = $now[3]."/".($now[4]+1)."/".($now[5]+1900)." ".$now[2].":".$now[1];
+
+    $size = $files{$f}{size};
+
+    $filename = $files{$f}{filename} ;
+
+	$url = $files{$f}{url};
+	$subject = "File ready for collection";
+	$subject = $q->param('subject') if($q->param('subject'));
+	$from = $config{mailfrom};
+	$from = $files{$f}{from} if($files{$f}{from});
+
+    # open conenction to SMTP server.  return error if failed.
+    $sock = new IO::Socket::INET(PeerAddr=>$config{smtpserver}, 
+		PeerPort=>$config{smtpport}, Proto=>'tcp');
+    if(!$sock) {
+		return "Cannot connect to server";
+    }
+#    fcntl($sock, F_SETFL(), O_NONBLOCK());
+    ($c,$m) = readstatus($sock); # get the welcome message
+	$m =~ /^(\S+)/; $svr = $1;
+
+    # send message envelope, check return codes
+    print $sock "HELO ".hostname()."\n";
+    ($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock;
+        return "Problem identifying myself";
+    }
+    print $sock "MAIL FROM: <$from>\n";
+    ($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock; 
+        return "Problem with sender ($m)";
+    }
+
+  	print $sock "RCPT TO: <$to>\n";
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+   	     close $sock; 
+   	     return "Problem with recipient ($m)";
+    }
+
+    # Now send the message
+    print $sock "DATA\n";
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+        close $sock; 
+        return "Problem sending data ($m)";
+    }
+
+	# send message
+	$msg = $q->param('msg'); $msg = "Please find attached file" if(!$msg);
+	print $sock "From: $from\n";
+    print $sock "To: $to\nSubject: [".$config{subject}."] $subject\nX-Mailer: UoA File dropoff\n\n";
+    print $sock "A file has been uploaded to the ".$config{organisation}." dropoff staging area for you.\n";
+	print $sock "The file has been uploaded by $from\n\n";
+
+    print $sock "To collect the file, use a web browser to go to the URL:\n";
+    print $sock "$url\n\n";
+    print $sock "The URL above has to be pasted in one line, please ensure this is the case if your\n";
+    print $sock "e-mail client truncates it.\n\n\n";
+    print $sock "File information:\n";
+    print $sock "File name: $filename\n";
+    print $sock "File size: $size \n";
+    print $sock "Uploaded at: $date\n";
+    print $sock "\n".$config{mailfromname}."\n";
+
+	# close
+	print $sock "\n.\n";
+
+	($c,$m)=readstatus($sock);
+    if($c>=500) {
+		close $sock; 
+        return "Problem sending message";
+    }
+	$m =~ /(\S+)\s*$/; $id = $1;
+	print $sock "QUIT\n";
+    close $sock;
+
+	print "Renotification message sent to $to: $id\@$svr<br>\n";
+#	dolog("RESEND\t\t$code\t$pass\t$to\t$from\t$id\t$svr");
+
+	return 0; # success
+}
+sub do_footer() {
+    if( $config{pagefooterwaiting} and -r $config{pagefooterwaiting} ) {
+        open HTML,"<".$config{pagefooterwaiting};
+        while(<HTML>) { print; }
+        close HTML;
+    }
+    print $q->end_html();
+}
+sub do_header() {
+    my(%html);
+    print $q->header(-expires=>"now")."\n";
+    %html = (-title=>"WebDropoff Admin",-bgcolor=>"#FFFFFF",
+        -leftmargin=>1, -topmargin=>0, -marginwidth=>1, -marginheight=>0 );
+    $html{-style}={src=>$config{stylesheet}} if($config{stylesheet});
+    print $q->start_html(%html)."\n";
+
+    if( $config{pageheaderwaiting} and -r $config{pageheaderwaiting} ) {
+        open HTML,"<".$config{pageheaderwaiting};
+        while(<HTML>) { print; }
+        close HTML;
+    }
+	print $q->h1("Contents")."\n";
+}
+
+sub get_files {
+	my($f, $h, $c);
+	my(%this,@s);
+	my($siz,$sufx);
+
+	foreach $f ( glob($config{dropdir}."/*.info") ) {
+		%this = ( );
+		if ( $f =~ /\/([^\s\/]+)\.(\d+)\.info/ ) { ($h,$c) = ($1,$2); }
+		open INFO, "<$f" or next;
+		while( <INFO> ) {
+			chomp;
+			if( /^Content-Disposition:\s+(\S.*)/ ) { $this{filename} = $1; }
+			if( /^Origin:.*SMTP/ ) { $this{ricoh} = 1; next; }
+			if( /^Encrypted-By:\s*(\S+)/ ) { 
+				$this{key}=$1; 
+				$this{encrypted} = 2; # override other settings
+				$this{key}=~s/\./\//; next;}
+			if( /^Encrypted-File:\s*(\S+)/ ) {
+				$this{key}=$1; 
+				$this{encrypted} = 1 if(!$this{encrypted});
+				$this{key}=~s/\./\//;  next;}
+			if( /^Origin:.*-XXXX/ ) { 
+				$this{encrypted} = 1 if(!$this{encrypted}); 
+				next;}
+		}
+		close INFO;
+		next if(! -f $config{dropdir}."/$h.$c");
+		@s = stat($config{dropdir}."/$h.$c");
+		$this{rawsize} = $s[7];
+		$siz = $s[7]; $sufx = "";
+		if( $siz > 1024000 ) {
+			$siz /= 1024000; $sufx = "M";
+		} elsif( $siz > 1024 ) {
+			$siz /= 1024; $sufx = "K";
+		}
+		$siz = ( int($siz * 100) / 100 );
+		$this{size} = $siz.$sufx."b";
+		$this{rawdate} = $s[9];
+		$this{date} = "".localtime($s[9]);
+		$this{date} =~ s/\d\d\d\d\s*$//; # remove year
+		$this{date} =~ s/^\s*[MTWFS]..\s+//; # Day of week
+		$this{date} =~ s/:(\d)$/:0\1/; # fix time errors
+		$this{url} = $config{pickupurl}."/$h/$c";
+		$this{filecode} = $h;
+		$this{passcode} = $c;
+		
+		$files{$f} = { %this };
+	}
+}
+sub read_log {
+	my($from, $to, $h, $c, $ip, $key );
+	my(@line);
+	open LOG, "<".$config{logdir}."/dropoff.log" or return;
+	while ( <LOG> ) {
+		@line = split /\t/,$_;
+		if($line[1] eq 'AUTHCODE') {
+			($h,$c) = ($line[2],$line[3]);
+		} else {
+			($h,$c) = ($line[3],$line[4]);
+		}
+		$key = $config{dropdir}."/$h.$c.info";
+		next if(!defined $files{$key} ); # IE, the file is not here
+		if( $line[1] eq 'RECV' ) {
+			$files{$key}{upi} = $line[2]; # UPI if we have it
+			$files{$key}{from} = $line[2]; # UPI if we have it, else...
+			$files{$key}{from} = $line[6] if(!$files{$key}{from}); #email
+			$files{$key}{to} = $line[5];
+			$files{$key}{to} =~ s/,/, /g if($files{$key}{to});
+			$files{$key}{to} = $1 if($files{$key}{to} =~ /<(.*)>/ );
+			$files{$key}{received} = $line[0];
+		} elsif( $line[1] eq 'SEND' ) {
+			$files{$key}{notified} = $line[0]; # when notify was sent out
+			$files{$key}{upi} = $line[2]; # UPI if we have it, else...
+			$files{$key}{from} = $line[2]; # UPI if we have it, else...
+			$files{$key}{from} = $line[6] if(!$files{$key}{from}); #email
+			$files{$key}{to} = $line[5];
+			$files{$key}{to} = $1 if($files{$key}{to} =~ /<(.*)>/ );
+		} elsif( $line[1] eq 'AUTHCODE' ) {
+			$files{$key}{authcode} = $1
+				if( $line[0] =~ /(\d+:\d+)/); # when authcode was sent out
+		} elsif( $line[1] eq 'VIRUS' ) {
+			$files{$key}{virus} = $line[5];
+		} elsif( $line[1] eq 'PICKUP' ) {
+			$files{$key}{collected} = $line[6]."<BR>".$line[0];
+		} elsif( $line[1] eq 'CONFIRM' ) {
+			$files{$key}{confirmed} = $line[0];
+		} elsif( $line[1] eq 'ERROR' ) {
+			$files{$key}{error} = $line[5];
+		} elsif( $line[1] eq 'ENCRYPT' ) {
+			$files{$key}{encrypted} = 1 if(!$files{$key}{encrypted});
+		} elsif(( $line[1] eq 'DECRYPT' ) 
+			or ( $line[1] eq 'KEY' )
+			or ( $line[1] eq 'CHECKSUM' )
+			or ( $line[1] eq 'DELETE' )
+			or ( $line[1] eq 'UNKNOWN' )
+			or ( $line[1] eq 'INVALID' )
+		) {
+			# not interested
+		} else {
+			print "\nUnknown: ".$line[1]."\n";
+		}
+	}
+	close LOG;
+}
+sub print_hdr($$) {
+	my($rv) = "";
+	$rv =  "<TABLE border=0 cellspacing=0 cellpadding=0 width=100%><TR><TD>";
+	$rv .= $_[0]."</TD><TD align=right>";
+	$rv .= "<A href=".$q->url()."?sort=".$_[1].">^</a> ";
+	$rv .= "<A href=".$q->url()."?sort=".$_[1]."&rev=1>v</a>";
+	$rv .= "</TD></TR></TABLE>\n";
+	return $rv;
+}
+
+sub print_list {
+	my($f,$chk,$n);
+
+	print "<FORM action=".$q->url()." method=POST>";
+	print $q->center(
+		"Checked files: ".$q->submit("A","Delete files")." "
+		.$q->submit("A","Remind recipients")." "
+		.$q->submit("A","More information")
+		." Check: ".$q->submit("A","Collected")
+		." ".$q->submit("A","Uncollected")
+	);
+	print "<TABLE border=1 align=center width=100%>";
+	print "<TR><TD>".print_hdr("Filename",1)."</TD>";
+	print "<TD>".print_hdr("Size",2)."</TD>";
+	print "<TD>".print_hdr("Date",3)."</TD>";
+	print "<TD>".print_hdr("From",4)."</TD>";
+	print "<TD>To</TD><TD>Collected?</TD><TD></TD></TR>\n";
+	foreach $f ( sort bywhatever keys %files ) {
+		print "<TR>";
+		$n = $files{$f}{filename};
+		if( length $n > 60 ) {
+			$n = substr($n,0,60)."<BR>".substr($n,60,60);
+		}
+		print "<TD><small>".$q->a({href=>$files{$f}{url}},$n);
+		print "<I>(encrypted)</I>" 
+			if($files{$f}{encrypted});
+		print "<I>(<A HREF=".$config{pickupurl}."/".$files{$f}{key}.">key</A>)</I>" 
+			if($files{$f}{encrypted} == 2);
+		print "<I>(<A href=".$config{pickupurl}."/".$files{$f}{key}.">locks</A>)</I>" 
+			if(($files{$f}{encrypted} == 1) and $files{$f}{key});
+		print "<I>(SMTP)</I>" if($files{$f}{ricoh});
+		print "</small></TD>";
+		print "<TD align=right>".$files{$f}{size}."</TD>";
+		print "<TD><small>".$files{$f}{date}."</small></TD>";
+		print "<TD>";
+		if($files{$f}{from} =~ /\@/) {
+			print "<small><a href=mailto:".$files{$f}{from}.">".$files{$f}{from}."</a></small>";
+		} else {
+			print $files{$f}{from};
+		}
+		if($files{$f}{authcode}) {
+			print "<BR><SMALL>Authcode sent: ".$files{$f}{authcode}."</SMALL>" ;
+		}
+		print "</TD>";
+		print "<TD><small><a href=mailto:".$files{$f}{to}.">".$files{$f}{to}."</a></small>";
+		if($files{$f}{notified}) {
+			print "<BR><SMALL>Notified: ".$files{$f}{notified}."</SMALL>" ;
+		} elsif($files{$f}{authcode}) {
+			print "<BR><SMALL>Awaiting authcode to notify</SMALL>" ;
+		}
+		print "</TD>";
+		print "<TD>".$files{$f}{collected}."</TD>";
+		$chk = 0;
+		$chk = 1 if($CMD eq "Collected" and $files{$f}{collected});
+		$chk = 1 if($CMD eq "Uncollected" and !$files{$f}{collected});
+		print "<TD>".$q->checkbox(-name=>"F",-checked=>$chk,-label=>"",-value=>$f, -override=>1)."</TD>";
+		print "</TR>\n";
+	}
+	print "</TABLE>\n";
+
+	print $q->center(
+		" Checked files: "
+		.$q->submit("A","Delete files")." "
+		.$q->submit("A","Remind recipients")." "
+		.$q->submit("A","More information")
+		." Check: ".$q->submit("A","Collected")
+		." ".$q->submit("A","Uncollected")
+	);
+	print "</FORM>\n";
+}
+
+#########################################################################
+# MAIN
+
+
+$reverse = 1 if($q->param('rev'));
+$smethod = $q->param('sort') if($q->param('sort'));
+$CMD = $q->param('A') if($q->param('A'));
+@FILES = $q->param('F') if($q->param('F'));
+
+readconfig;
+do_header;
+get_files;
+read_log;
+if($CMD and $CMD ne "Collected" and $CMD ne "Uncollected" )  {
+	if($CMD eq "Delete files") {
+		foreach ( @FILES ) {
+			if( -f $_ ) {
+				print "Deleted file \"".$files{$_}{filename}."\" to ".$files{$_}{to}."<BR>\n";
+				if($files{$_}{key}) {
+					my($tf) = $files{$_}{key};
+					$tf =~ s/\//./; $tf = $config{dropdir}."/$tf";
+					print "Deleted file \"".$files{"$tf.info"}{filename}."\" to ".$files{$_}{to}."<BR>\n";
+					unlink $tf; 
+					unlink "$tf.info";
+				}
+				unlink $_; s/\.info$//; unlink $_;
+			}
+		}
+		# reload all the stuff
+		%files = ();
+		get_files;
+		read_log;
+	} elsif($CMD eq "Remind recipients") {
+		foreach ( @FILES ) {
+			doreminder($_);
+		}
+	} elsif($CMD eq "More information") {
+		foreach ( @FILES ) {
+			print "File \"".$files{$_}{filename}."\" stored as $_<BR>\n";
+		}
+	} else {
+		print "<P>Sorry: unable to run command '$CMD' on files<BR>".(join "<BR>",@FILES)."</P>\n";
+	}
+
+}
+print_list;
+do_footer;
+
+exit(0);
