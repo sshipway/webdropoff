@@ -8,6 +8,7 @@
 #              correct harndling of arguments eg -d
 #         2.5: Bring versions in line; correct return codes, case insensitive
 #         2.6: More intelligence in attachment extraction
+#         2.7: Use MIME::Parser instead of manual way
 
 use strict;
 use FileHandle;
@@ -15,11 +16,13 @@ use MIME::Base64;
 use Digest::MD5;
 use IO::Socket;
 use Sys::Hostname;
+use MIME::Parser;
 
 my($CONFIG) = "/u01/etc/dropoff.conf";
 my($TYPE) = "";
+my($DISPOSITION) = "";
 my($DEBUG) = 0;
-my($VERSION) = "2.6";
+my($VERSION) = "2.7";
 
 ##############################################################################
 my($cmd) = "";
@@ -214,6 +217,7 @@ sub dropoff($$) {
 	my($hash) = "";
 	my($code) = "";
 	my($f);
+	my($fname);
 
 	# calculate checksum
 	# rename file
@@ -226,13 +230,22 @@ sub dropoff($$) {
 
 	# create info file
     if( open INFO, ">".$config{dropdir}."/$f.info" ) {
-		if($TYPE eq "pdf") {
+		if($TYPE =~ /\// ) {
+        	print INFO "Content-Type: $TYPE\n";
+		} elsif($TYPE =~ /pdf/ ) {
         	print INFO "Content-Type: application/pdf\n";
 		} else {
         	print INFO "Content-Type: image/$TYPE\n";
 		}
-        print INFO "Content-Disposition: scan.$TYPE\n";
-        print INFO "Origin: SMTP-".(uc $TYPE)."\n";
+		if( $DISPOSITION ) {
+			$fname = $DISPOSITION;
+		} elsif( $TYPE =~ /\/(...)/ ) {
+			$fname = "upload.$1";
+		} else {
+			$fname = "upload";
+		}
+        print INFO "Content-Disposition: $fname\n";
+        print INFO "Origin: SMTP\n";
         print INFO "Notified: ".localtime()."\n";
         print INFO "Recipient: $to\n";
         close INFO;
@@ -242,7 +255,7 @@ sub dropoff($$) {
 	notify($to,$hash,$code);
 
 	# append to dropoff log
-	dolog("RECV\tRICOH\t$hash\t$code\t$to\tNONE\tscan.$TYPE\t");
+	dolog("RECV\tRICOH\t$hash\t$code\t$to\tNONE\t$fname\t");
 
 	# and go home
 	return $hash;
@@ -254,6 +267,10 @@ sub reademail {
 	my($inhead) = 1;
 	my($mimesep) = "--";
 	my($indata) = 0;
+	my($entity);
+
+	my($parser) = new MIME::Parser;
+	$parser->output_to_core(1);
 	
 	print LOG "< Envelope from: $from\n" if($DEBUG);
 	print LOG "< Envelope to  : $to\n" if($DEBUG);
@@ -267,45 +284,43 @@ sub reademail {
 		logprint "501 Failed to create temporary file\r\n";
 		return;
 	};
+	$data = "";
 	logprint "354 Start input now\r\n";
 	alarm(60); # shouldnt take more than a minute
-	while ($line = <STDIN>) {
-		last if($line =~ /^\.\s*$/ );
-		if(!$section) {
-			if($line =~ /boundary="(\S+)"/ ) { 
-				$mimesep = $1; 
-				print LOG "< Boundary: $mimesep\n" if($DEBUG);
-			}
-		}
-		if($inhead) {
-			if($line =~ /^\s*$/) { 
-				print LOG "< End of headers\n" if($DEBUG);
-				$inhead = 0; 
-				next;
-			}
-			if( !$TYPE and $line =~ /^\s*content-type\s*:.*(pdf|tif)/i ) {
-				$TYPE = $1; $indata = 1;
-				print LOG "< Section type is $TYPE\n" if($DEBUG);
-				next;
-			}
-			if( $line =~ /^\s*content-type\s*:\s*(\S+)/i ) {
-				print LOG "< Ignored section type $1\n" if($DEBUG);
-			}
-			next;
-		}
-		if($line =~ /^-*$mimesep/) { 
-			print LOG "< New section detected\n" if($DEBUG);
-			$section++; $inhead = 1; $indata = 0; next; 
-		}
-
-		if($indata and $TYPE) {
-			$data = decode_base64($line);
-			print EMAIL $data;
-		} else {
-			print LOG "< Ignored: $line" if($DEBUG);
-		}
+	while( $line = <STDIN> ) {
+		last if( $line =~ /^\.\r?\n?$/ );
+		$data .= $line;
 	}
 	alarm(0);
+	$entity = $parser->parse_data($data);
+	$TYPE = "";
+	$DISPOSITION = "";
+	if($entity->is_multipart) {
+		for( my $i=0;$i < $entity->parts; $i++ ) {
+			my $p = $entity->parts($i);
+			# logprint "501 Attachment $i has type ".$p->mime_type."\r\n";
+			next if($p->is_multipart);
+			next if($p->mime_type =~ /^text/);
+			next if($p->mime_type =~ /signature/);
+			$TYPE = $p->mime_type;
+			my($h) = $p->head->get('Content-Disposition');
+			if( $h and $h =~ /filename="([^"]+)"/ ) {
+				$DISPOSITION = $1;
+			} elsif( $h and $h =~ /filename=([^\s;]+)/ ) {
+				$DISPOSITION = $1;
+			}
+			my $bh = $p->bodyhandle;
+			$bh->binmode("ON");
+			my $IO = $bh->open("r");
+			while (defined($_ = $IO->getline)) {
+				print EMAIL $_;
+			}
+			$IO->close;
+			last;
+		}
+	} else {
+		logprint "501 Message does not have attachments\r\n";
+	}
 	close EMAIL;
 	if($TYPE) {
 		$qid = dropoff($to,$tmpfile);
@@ -315,7 +330,7 @@ sub reademail {
 			logprint "250 Ok: Stored as $qid.\r\n";
 		}
 	} else {
-		logprint "501 Failed to extract image file from mail\r\n";
+		logprint "501 Failed to extract attachment from mail\r\n";
 	}
 	unlink $tmpfile if( -f $tmpfile ); # tidy up
 }

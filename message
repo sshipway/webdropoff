@@ -1,0 +1,98 @@
+HELO test
+MAIL FROM: A1@auckland.ac.nz
+RCPT TO: s.shipway@auckland.ac.nz
+DATA
+Return-Path: <sshi052-owner@list.auckland.ac.nz>
+X-Original-To: sshi052@lstappprd01.its.auckland.ac.nz
+Delivered-To: sshi052@lstappprd01.its.auckland.ac.nz
+Received: by sympa.auckland.ac.nz (Postfix, from userid 498)
+        id 691B331887; Mon, 24 Sep 2012 13:44:16 +1200 (NZST)
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="----B1592E8D88A6F59CC6E7DC0B0BF8BF4C"
+Subject: Management of list sshi052
+X-Mailer: Sympa 6.1.11
+Auto-Submitted: auto-generated
+Reply-To: sshi052-request@list.auckland.ac.nz
+To: sshi052@lstappprd01.its.auckland.ac.nz
+Content-Transfer-Encoding: 7BIT
+From: SYMPA <sympa@list.auckland.ac.nz>
+Message-Id: <20120924014416.691B331887@sympa.auckland.ac.nz>
+Date: Mon, 24 Sep 2012 13:44:16 +1200 (NZST)
+Status: O
+
+preamble: This is an S/MIME signed message
+
+------B1592E8D88A6F59CC6E7DC0B0BF8BF4C
+Content-Type: text/plain; charset="US-ASCII"
+Content-Transfer-Encoding: 7BIT
+
+
+You have been delegated the responsability of list moderator by
+s.shipway@auckland.ac.nz for list sshi052@list.auckland.ac.nz.
+
+
+The list homepage: https://list.auckland.ac.nz/sympa/info/sshi052
+Owner and moderator guide: https://list.auckland.ac.nz/sympa/help/admin
+
+
+
+
+------B1592E8D88A6F59CC6E7DC0B0BF8BF4C
+Content-Type: application/data; name="smime.p7s"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="smime.p7s"
+
+MIIH5wYJKoZIhvcNAQcCoIIH2DCCB9QCAQExCzAJBgUrDgMCGgUAMAsGCSqG
+SIb3DQEHAaCCBT8wggU7MIIEI6ADAgECAhAt5CL5rdOyopyadzMdHA25MA0G
+CSqGSIb3DQEBBQUAMFoxCzAJBgNVBAYTAkFVMRAwDgYDVQQKEwdBdXNDRVJU
+MR0wGwYDVQQLExRDZXJ0aWZpY2F0ZSBTZXJ2aWNlczEaMBgGA1UEAxMRQXVz
+Q0VSVCBDbGllbnQgQ0EwHhcNMTIwODMxMDAwMDAwWhcNMTUwODMxMjM1OTU5
+WjCB0zENMAsGA1UEERMEMTE0MjEoMCYGA1UEChMfSW5mb3JtYXRpb24gVGVj
+aG5vbG9neSBTZXJ2aWNlczEaMBgGA1UECRMRUHJpdmF0ZSBCYWcgOTIwMTkx
+FDASBgNVBAgTC05ldyBaZWFsYW5kMREwDwYDVQQHEwhBdWNrbGFuZDELMAkG
+A1UEBhMCTloxGjAYBgNVBAMTEVRlc3QgTWFpbGluZyBMaXN0MSowKAYJKoZI
+hvcNAQkBFhtzc2hpMDUyQGxpc3QuYXVja2xhbmQuYWMubnowggEiMA0GCSqG
+SIb3DQEBAQUAA4IBDwAwggEKAoIBAQCT/KfeDRHmVI9Z3Tl4klbGFQYnZmrs
+YMclLRvb8rwar6NFK/hwIodWIdn3fl0KdhgulnJlYmM83uTs9bhaUX0kiJSL
+N2n0FW2A9VBVqxbFMSnvS5h7IIubxYtDfp3872kmeKLAInsqKPGLVT5MiMDP
+UfiDnajC2ssGuq7K8ft/juFI/RKe477tPDoysc1Roh8AxWGH8PxYdgRr7Gmw
+1+vw+I23j5aQ8T2/1IOyLrcz6hpKPReB7PDWNjHuRxQGB8zUgegF3kvuWMXj
+Tgfv/dVDB8thSe+qXDG8B88vaOM+iQ0P5l6uHtwPIKTyubYdBMKS5HPz99ux
+kzvfYuNVrArjAgMBAAGjggGBMIIBfTAfBgNVHSMEGDAWgBRXkeHgDC0txPy/
+RJCcxGvp8ifGizAdBgNVHQ4EFgQUvGV3A1dgissy3R5VtQBWlpF1KGcwDgYD
+VR0PAQH/BAQDAgWgMAwGA1UdEwEB/wQCMAAwHQYDVR0lBBYwFAYIKwYBBQUH
+AwQGCCsGAQUFBwMCMBoGA1UdIAQTMBEwDwYNKwYBBAGBtz0FAQEAATBBBgNV
+HR8EOjA4MDagNKAyhjBodHRwOi8vY3JsLmNzLmF1c2NlcnQub3JnLmF1L0F1
+c0NFUlRDbGllbnRDQS5jcmwwdwYIKwYBBQUHAQEEazBpMDwGCCsGAQUFBzAC
+hjBodHRwOi8vY3J0LmNzLmF1c2NlcnQub3JnLmF1L0F1c0NFUlRDbGllbnRD
+QS5jcnQwKQYIKwYBBQUHMAGGHWh0dHA6Ly9vY3NwLmNzLmF1c2NlcnQub3Jn
+LmF1MCYGA1UdEQQfMB2BG3NzaGkwNTJAbGlzdC5hdWNrbGFuZC5hYy5uejAN
+BgkqhkiG9w0BAQUFAAOCAQEAI64k4uxGYaUH5Zpny7g0fLb3AIjbDiUe5AFQ
+1fJVibHa0aPfm6Hux0XDIo+XZnD01AHMkEIgSlfAm2zA0T6nTLRyUbs8UTob
+VOAJzriHx61Kcdy9HIj5vi4xBfIpJhZlawvI+o0D3yiLgWLtkr06mQHSZUgx
+NG4xIDR99xZpX4LFFEmPzXewxLx2rlmr2/mI6vE9ocyjUhmllaKTxrsBgW4v
+8CVUCiHTjlc72Ksug5f2xBrxyngrF1sDWj51ew9EN4pWUh0/AsKD/FeIJ94F
++PigvEngq5f/tgKApOr3FBhq2opLH638aqJfvozL/6x+wfDLvCr/MvaJ5uYA
+jTNcDzGCAnAwggJsAgEBMG4wWjELMAkGA1UEBhMCQVUxEDAOBgNVBAoTB0F1
+c0NFUlQxHTAbBgNVBAsTFENlcnRpZmljYXRlIFNlcnZpY2VzMRowGAYDVQQD
+ExFBdXNDRVJUIENsaWVudCBDQQIQLeQi+a3TsqKcmnczHRwNuTAJBgUrDgMC
+GgUAoIHYMBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkF
+MQ8XDTEyMDkyNDAxNDQxM1owIwYJKoZIhvcNAQkEMRYEFFq51jwnSX+Ze8VZ
+idR75q6rmhayMHkGCSqGSIb3DQEJDzFsMGowCwYJYIZIAWUDBAEqMAsGCWCG
+SAFlAwQBFjALBglghkgBZQMEAQIwCgYIKoZIhvcNAwcwDgYIKoZIhvcNAwIC
+AgCAMA0GCCqGSIb3DQMCAgFAMAcGBSsOAwIHMA0GCCqGSIb3DQMCAgEoMA0G
+CSqGSIb3DQEBAQUABIIBAAIa8KjNNv2lgjAQUiKtj+QJ/TK9JWykHIdgHDUF
+ds++Srw0EFR3UQrpO5rSUHqHPUAmgN7vHc4I72TU9n6sx5E4eBZxZyDudX1L
+bWyA/kQnNonFYKu3VSnIbFUh1qMc5prz1VhNg3MfP0kBA9OwfV5nJW274e7k
+c95o+AaTGDjcYyWPJnzExEwnG1KVGyRCmfncIgBuUgLkxk5t3eR7xxJBSdeZ
+4BLc/XhyES7HSnduUs/5V/p2hQ5+DMLhE1y/NGnIpEOSRjkA6x5fA0CCUx6a
+YBgHC2VyxmD44/DOrATKq1fIXjTWBGncoscw94zHmbqPLoWgiJqR6a4JT2DK
+jfk=
+
+------B1592E8D88A6F59CC6E7DC0B0BF8BF4C--
+
+footer -- this is the mime footer
+
+.
+QUIT
+
